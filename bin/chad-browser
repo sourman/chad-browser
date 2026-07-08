@@ -98,7 +98,11 @@ strip_transient() {
 pick_free_port() {
   local p res
   for ((p=CB_PORT_MIN; p<=CB_PORT_MAX; p++)); do
-    [[ -e "$RUNDIR/$p.env" ]] && continue
+    # Atomic reservation: mkdir succeeds for exactly one concurrent caller on
+    # the same filesystem. This closes the TOCTOU where two `up` calls both
+    # passed the old `[[ -e ... ]]` check before either wrote the runfile.
+    # The reserve dir is cleaned up by the caller on both success and failure.
+    mkdir "$RUNDIR/.reserve-$p" 2>/dev/null || continue
     res=$(python3 - "$p" <<'PY' 2>/dev/null
 import socket, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -107,7 +111,12 @@ except OSError: print("busy")
 finally: s.close()
 PY
 )
-    [[ "$res" == "free" ]] && { echo "$p"; return 0; }
+    if [[ "$res" == "free" ]]; then
+      echo "$p"
+      return 0
+    fi
+    # Port busy on the socket side — release the reservation and keep scanning.
+    rmdir "$RUNDIR/.reserve-$p" 2>/dev/null || true
   done
   return 1
 }
@@ -219,6 +228,7 @@ EOF
     pkill -f "user-data-dir=$prof" 2>/dev/null || true
     kill -9 "$pid" 2>/dev/null || true
     rm -rf "$prof" "$RUNDIR/$port.env"
+    rmdir "$RUNDIR/.reserve-$port" 2>/dev/null || true
     die "Chromium CDP didn't come up on port $port"
   fi
   local ws; ws=$(ws_endpoint "$port")
@@ -237,6 +247,7 @@ EOF
       kill -9 "$pid" 2>/dev/null || true
       kill "$driver_pid" 2>/dev/null || true
       rm -rf "$prof" "$sock" "$RUNDIR/$port.env"
+      rmdir "$RUNDIR/.reserve-$port" 2>/dev/null || true
       die "driver daemon didn't come up (see $driver_log)"
     fi
   else
@@ -259,6 +270,8 @@ SHELL_PID=$PPID
 DRIVER_PID=$driver_pid
 SOCKET=$sock
 EOF
+  # The real runfile is committed; the atomic reserve dir is now redundant.
+  rmdir "$RUNDIR/.reserve-$port" 2>/dev/null || true
 
   if [[ $json -eq 1 ]]; then
     python3 - "$port" "$name" "$pid" "$prof" "$ws" "$sock" "$driver_pid" <<'PY'
@@ -440,7 +453,11 @@ if timeout_json:
         pass
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(client_timeout)
-s.connect(sock_path)
+try:
+    s.connect(sock_path)
+except (ConnectionRefusedError, FileNotFoundError) as e:
+    sys.stdout.write(json.dumps({"error": f"driver socket refused ({e}) — driver not running? run chad-browser list, then chad-browser down + up to recover"}) + "\n")
+    sys.exit(1)
 payload = json.dumps({"eval": code})
 if timeout_json:
     payload = payload[:-1] + timeout_json + "}"
@@ -509,24 +526,46 @@ cmd_gc() {
       fi
     )
   done
-  # Reap orphan driver processes: a node driver.mjs whose socket path no longer
-  # has a runfile and no longer exists on disk. These linger when a wedged driver
-  # outlived its instance (e.g. an infinite-loop eval body).
+  # Reap orphan driver processes. Two cases:
+  #  (a) socket file gone (wedged driver outlived its instance) — the original case
+  #  (b) socket file present but NO runfile references it (concurrent-up race orphan)
+  local live_sockets
+  live_sockets=$(grep -hE '^SOCKET=' "$RUNDIR"/*.env 2>/dev/null | cut -d= -f2- || true)
   while IFS= read -r dpid; do
     [[ -n "$dpid" ]] || continue
-    local cmdline socket_gone=1
+    local cmdline sock_arg
     cmdline=$(tr '\0' ' ' < "/proc/$dpid/cmdline" 2>/dev/null) || continue
-    # Extract the socket path arg (second positional after wsUrl).
     case "$cmdline" in
       *driver.mjs*)
-        local sock_arg
         sock_arg=$(printf '%s' "$cmdline" | grep -oE '/run/user/[0-9]+/chad-browser/[^ ]+\.sock' | head -1)
-        if [[ -n "$sock_arg" && ! -e "$sock_arg" ]]; then
-          kill "$dpid" 2>/dev/null && echo "reaped orphan driver $dpid (socket $sock_arg gone)"
+        [[ -n "$sock_arg" ]] || continue
+        # Reap if socket file is gone, OR if no live runfile claims this socket.
+        if [[ ! -e "$sock_arg" ]] || ! grep -qF "$sock_arg" <<<"$live_sockets"; then
+          kill "$dpid" 2>/dev/null && echo "reaped orphan driver $dpid (socket $sock_arg unowned)"
+          [[ -e "$sock_arg" ]] && rm -f "$sock_arg" 2>/dev/null || true
         fi
         ;;
     esac
   done < <(pgrep -f 'driver.mjs' 2>/dev/null)
+  # Reap orphan Chromium processes whose --user-data-dir points into EPHEM_ROOT
+  # but no live runfile references that profile. Catches concurrent-up race orphans
+  # that the runfile-keyed sweep above can't see.
+  local live_profiles
+  live_profiles=$(grep -hE '^PROFILE=' "$RUNDIR"/*.env 2>/dev/null | cut -d= -f2- || true)
+  while IFS= read -r cpid; do
+    [[ -n "$cpid" ]] || continue
+    local cmdline prof_arg
+    cmdline=$(tr '\0' ' ' < "/proc/$cpid/cmdline" 2>/dev/null) || continue
+    prof_arg=$(printf '%s' "$cmdline" | grep -oE -- "--user-data-dir=[^ ]*" | head -1 | cut -d= -f2-)
+    [[ -n "$prof_arg" ]] || continue
+    case "$prof_arg" in
+      "$EPHEM_ROOT"/*)
+        if ! grep -qF "$prof_arg" <<<"$live_profiles"; then
+          kill "$cpid" 2>/dev/null && echo "reaped orphan chromium $cpid (profile $prof_arg unowned)"
+        fi
+        ;;
+    esac
+  done < <(pgrep -f 'remote-debugging-port' 2>/dev/null)
   for d in "$EPHEM_ROOT"/*; do
     [[ -d "$d" ]] || continue
     if ! grep -qrF "PROFILE=$d" "$RUNDIR" 2>/dev/null; then rm -rf "$d"; echo "removed orphan $d"; fi
