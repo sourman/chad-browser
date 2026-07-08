@@ -161,6 +161,14 @@ cmd_up() {
       *)       urls+=("$1"); shift;;
     esac
   done
+  # Chromium refuses multiple URLs in headless mode ("Multiple targets are not
+  # supported in headless mode") and exits immediately, which surfaces only as a
+  # generic "CDP didn't come up" after the full launch timeout. Fail fast with a
+  # specific message instead. (Workaround: pass one URL, open the rest via
+  # Target.createTarget after launch.)
+  if [[ $headless -eq 1 && ${#urls[@]} -gt 1 ]]; then
+    die "multiple URLs are not supported with --headless (Chromium limitation); pass one URL and open more tabs via Target.createTarget after launch"
+  fi
   ensure_dirs
   [[ -d "$BASE/Default" ]] || die "base profile not found at $BASE (set CHAD_BROWSER_BASE)"
   command -v "$BIN" >/dev/null 2>&1 || die "binary '$BIN' not found (set CHAD_BROWSER_BIN)"
@@ -285,7 +293,9 @@ cmd_down() {
   source "$f"
   # Kill the driver first so eval calls fail fast rather than hang on the socket.
   [[ -n "${DRIVER_PID:-}" ]] && kill "$DRIVER_PID" 2>/dev/null || true
-  [[ -n "${SOCKET:-}" ]] && rm -f "$SOCKET" 2>/dev/null || true
+  # Also reap any wedged driver still bound to this socket (e.g. an infinite-loop
+  # eval body that outlived its runfile). pkill by the socket path is specific.
+  [[ -n "${SOCKET:-}" ]] && { pkill -f "driver.mjs.*${SOCKET}" 2>/dev/null || true; rm -f "$SOCKET" 2>/dev/null || true; }
   pkill -f "user-data-dir=$PROFILE" 2>/dev/null || true
   kill "$PID" 2>/dev/null || true
   local i
@@ -373,22 +383,68 @@ resolve_socket() {
 # Send one JSON request over the Unix socket, read one newline-delimited response.
 # Usage: chad-browser eval [--id <name|port>] '<js>'
 cmd_eval() {
-  local id="" code=""
+  local id="" code="" timeout=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id|-n) id=$2; shift 2;;
+      --timeout|-t) timeout=$2; shift 2;;
+      --help|-h)
+        cat <<'HELP'
+chad-browser eval [--id <name|port|pid>] [--timeout <ms>] '<js>'
+
+Runs <js> in a Node context connected to the page. The body is wrapped in an
+async function — use `await` freely and `return` the result.
+
+In scope (no imports needed):
+  session.<Domain>.<Method>(params)   full raw CDP surface
+  evalInPage(jsExpr)                  Runtime.evaluate, returns value directly
+  navigate(url, {timeout?, hint?})    Page.navigate + wait for readyState 'complete'
+  typeInto(selector, text, {delay?})  focus + select-all + delete + insertText
+  resetInterception()                 disable Fetch/Network interception (un-wedge after block)
+  waitForReady({ check, timeout?, hint? })   poll a page JS expr until truthy
+  waitForDomStable({ timeout?, hint? })      wait until DOM node count stabilizes (3 samples)
+  onEvent(method, fn)                 subscribe to a CDP event; returns unsub fn
+  captureRequests(urlPattern, fn, {body?, timeout?})  capture matching network traffic
+  listPageTargets()                   page targets from Target.getTargets
+  use(targetId)                       switch the active page target (iframes/tabs)
+
+Options:
+  --timeout <ms>   eval body timeout in ms (default 120000; capped at 600000)
+                   also sets the client socket timeout to match.
+
+Reply: a single JSON line, {"value": ...} or {"error": "...", "stack": "..."}.
+HELP
+        return 0
+        ;;
       *)       code="$1"; shift;;
     esac
   done
-  [[ -n "$code" ]] || die "usage: chad-browser eval [--id <name|port|pid>] '<js>'"
+  [[ -n "$code" ]] || die "usage: chad-browser eval [--id <name|port|pid>] [--timeout <ms>] '<js>'"
   local sock; sock=$(resolve_socket "$id") || exit 1
-  python3 - "$sock" "$code" <<'PY'
+  local timeout_json=""
+  if [[ -n "$timeout" ]]; then
+    [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a number of ms"
+    timeout_json=", \"timeout\": $timeout"
+  fi
+  python3 - "$sock" "$code" "$timeout_json" <<'PY'
 import socket, json, sys
-sock_path, code = sys.argv[1], sys.argv[2]
+sock_path, code, timeout_json = sys.argv[1], sys.argv[2], sys.argv[3]
+# Default client socket timeout 120s; if the caller set a body timeout, match it
+# (plus a 10s grace so the driver's own timeout error arrives before the socket's).
+client_timeout = 120
+if timeout_json:
+    try:
+        body_ms = json.loads("{" + timeout_json.strip().rstrip(",") + "}")["timeout"]
+        client_timeout = max(120, (body_ms // 1000) + 10)
+    except Exception:
+        pass
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(120)
+s.settimeout(client_timeout)
 s.connect(sock_path)
-s.sendall((json.dumps({"eval": code}) + "\n").encode())
+payload = json.dumps({"eval": code})
+if timeout_json:
+    payload = payload[:-1] + timeout_json + "}"
+s.sendall((payload + "\n").encode())
 buf = b""
 while b"\n" not in buf:
     chunk = s.recv(65536)
@@ -401,17 +457,23 @@ PY
 
 # Like eval but reads the JS from a file (multi-line scripts).
 cmd_script() {
-  local id="" file=""
+  local id="" file="" timeout=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id|-n) id=$2; shift 2;;
+      --timeout|-t) timeout=$2; shift 2;;
       *)       file=$1; shift;;
     esac
   done
-  [[ -n "$file" ]] || die "usage: chad-browser script [--id <name|port|pid>] <file.js>"
-  [[ -f "$file" ]] || die "no such file: $file"
+  [[ -n "$file" ]] || die "usage: chad-browser script [--id <name|port|pid>] [--timeout <ms>] <file.js>"
+  # Accept regular files and FIFOs (covers process substitution like <(echo ...)).
+  [[ -f "$file" || -p "$file" ]] || die "no such file: $file"
   local code; code=$(<"$file")
-  cmd_eval "$id" "$code"
+  if [[ -n "$timeout" ]]; then
+    cmd_eval --id "$id" --timeout "$timeout" "$code"
+  else
+    cmd_eval --id "$id" "$code"
+  fi
 }
 
 # Interactive REPL — line-buffered stdin → eval, one response per line.
@@ -419,9 +481,12 @@ cmd_repl() {
   local id=""
   [[ "${1:-}" == "--id" || "${1:-}" == "-n" ]] && { id=$2; shift 2; }
   local sock; sock=$(resolve_socket "$id") || exit 1
-  echo "chad-browser repl → $sock  (Ctrl-D to exit)"
+  echo "chad-browser repl → $sock  (.exit or Ctrl-D to exit)"
   local line
   while IFS= read -r -e -p "> " line; do
+    case "$line" in
+      .exit|.quit|.q|exit|quit) echo; return 0;;
+    esac
     [[ -z "$line" ]] && continue
     cmd_eval "$id" "$line"
   done
@@ -438,12 +503,30 @@ cmd_gc() {
       source "$f"
       if ! kill -0 "$PID" 2>/dev/null; then
         [[ -n "${DRIVER_PID:-}" ]] && kill "$DRIVER_PID" 2>/dev/null || true
-        [[ -n "${SOCKET:-}" ]] && rm -f "$SOCKET" 2>/dev/null || true
+        [[ -n "${SOCKET:-}" ]] && { pkill -f "driver.mjs.*${SOCKET}" 2>/dev/null || true; rm -f "$SOCKET" 2>/dev/null || true; }
         rm -rf "$PROFILE"; rm -f "$f"
         echo "reaped $NAME (port $PORT)"
       fi
     )
   done
+  # Reap orphan driver processes: a node driver.mjs whose socket path no longer
+  # has a runfile and no longer exists on disk. These linger when a wedged driver
+  # outlived its instance (e.g. an infinite-loop eval body).
+  while IFS= read -r dpid; do
+    [[ -n "$dpid" ]] || continue
+    local cmdline socket_gone=1
+    cmdline=$(tr '\0' ' ' < "/proc/$dpid/cmdline" 2>/dev/null) || continue
+    # Extract the socket path arg (second positional after wsUrl).
+    case "$cmdline" in
+      *driver.mjs*)
+        local sock_arg
+        sock_arg=$(printf '%s' "$cmdline" | grep -oE '/run/user/[0-9]+/chad-browser/[^ ]+\.sock' | head -1)
+        if [[ -n "$sock_arg" && ! -e "$sock_arg" ]]; then
+          kill "$dpid" 2>/dev/null && echo "reaped orphan driver $dpid (socket $sock_arg gone)"
+        fi
+        ;;
+    esac
+  done < <(pgrep -f 'driver.mjs' 2>/dev/null)
   for d in "$EPHEM_ROOT"/*; do
     [[ -d "$d" ]] || continue
     if ! grep -qrF "PROFILE=$d" "$RUNDIR" 2>/dev/null; then rm -rf "$d"; echo "removed orphan $d"; fi

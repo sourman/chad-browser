@@ -47,9 +47,10 @@ auto-enables `Page`/`Runtime`/`DOM`/`Network`, attaches to the first page target
 and listens on a Unix socket at `$SOCKDIR/<name>.sock`. On success it writes a runfile
 to `~/.cache/chad-browser/run/<port>.env` and prints `PORT= NAME= PID= HTTP= WS= PROFILE= SOCKET=`.
 
-Wall-clock for `up` is typically 5-7s (profile clone + Chromium start + CDP wait + driver
-attach). It is not hung — the first launch of a session is slower because the base profile
-copy is cold; subsequent launches are faster.
+Wall-clock for `up` is typically ~1-7s (profile clone + Chromium start + CDP wait + driver
+attach). Headless launches are near the low end (~1s); the first launch of a session may be
+slower because the base profile copy is cold. It is not hung — `up` prints readiness once the
+driver socket is listening.
 
 All commands exit 0 on success, non-zero on error. `list` exits 0 whether or not any
 instances are running; `down <id>` exits non-zero with a message if no instance matches

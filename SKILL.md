@@ -53,9 +53,27 @@ chad-browser down myagent                                            # tear down
   skeleton/spinner selectors remain. Use when you don't know the framework.
 - **`listPageTargets()`** — returns page targets (for `Target.attachToTarget`).
 - **`use(targetId)`** — switch the active page target (e.g. for cross-origin iframes).
+- **`navigate(url, { timeout?, hint? })`** — `Page.navigate` + wait for
+  `readyState === 'complete'`. **Prefer this over the raw two-step** — it
+  eliminates the #1 wrong-answer source (reading mid-hydration after a nav).
+- **`typeInto(selector, text, { delay? })`** — focus + select-all + delete +
+  `Input.insertText`. **Replaces** the field value (unlike raw `insertText`,
+  which appends). Works on React-controlled inputs. Returns the new value.
+  Throws clearly on readonly/disabled/hidden/contenteditable.
+- **`resetInterception()`** — disable `Fetch`/`Network.setRequestInterception`.
+  Call after traffic-interception experiments (blocking/mocking requests) so the
+  loader doesn't stay wedged.
+- **`onEvent(method, fn)`** — subscribe to a CDP event (e.g. `'Network.requestWillBeSent'`).
+  Returns an unsubscribe function. The `Page`/`Runtime`/`DOM`/`Network` domains are already
+  enabled for you — don't call `*.enable` yourself, and remember **events are not methods**
+  (`session.Network.requestWillBeSent(...)` is a bug, not a subscription).
+- **`captureRequests(urlPattern, fn, opts?)`** — ergonomic wrapper: run `fn` while collecting
+  matching network requests + response bodies. Returns `{ requests, count }`. The right tool
+  for "click this and tell me what API calls it made."
 
 Every `eval` call **must `return` its result** — the top-level value becomes the reply.
 For multi-step flows, write the JS to a file and use `chad-browser script <file.js>`.
+Long-running flows can raise the 120s default body timeout with `--timeout <ms>` (capped at 600000).
 
 ### Reading page content safely
 
@@ -109,6 +127,13 @@ relying on a detail:
    early — call `waitForReady` / `waitForDomStable` and retry.
 5. **Always `return` from `eval`.** No `return` means no value in the reply. The JS
    body is wrapped in an async function; use `await` freely.
+6. **CDP events are not methods.** `session.Network.requestWillBeSent(...)` is a bug —
+   that's an *event* name. Subscribe with `onEvent(...)` or use `captureRequests(...)`.
+   The read domains (`Page`/`Runtime`/`DOM`/`Network`) are auto-enabled on attach; don't
+   call `*.enable` yourself.
+7. **Navigations auto-re-attach.** `Page.navigate` / `Page.reload` / SPA route changes no
+   longer detach the target — the driver re-attaches on `Page.frameNavigated` and retries
+   calls that land mid-navigation. Still follow a navigation with `waitForReady`.
 
 Full detail in `references/auth-and-cdp.md` and `references/driving.md`.
 
