@@ -52,7 +52,7 @@ per-tab WS from `/json`.
    fresh from the (possibly updated) base. Don't expect mid-session logins to persist
    across a restart unless done in the base.
 3. **Ports are shared and finite** (`9300–9499`). Use `chad-browser list` to see what's
-   taken; `chad-browser gc` reaps dead processes' profiles. Don't pin a port an agent
+   taken; `chad-browser gc` reaps dead processes' profiles + sockets. Don't pin a port an agent
    already holds.
 4. **Always `down`.** It kills by `user-data-dir=<profile>` (so it gets the right
    instance), waits, force-kills, then removes the profile dir and runfile. Skipping it
@@ -65,13 +65,18 @@ per-tab WS from `/json`.
 ## Verifying auth survived
 
 Open the clone to a page that reflects login state (e.g. a dashboard) and check the page
-title / URL via `/json`:
+content via the driver:
 
 ```bash
 chad-browser up --name verify https://app.example.com/home
-PORT=$(chad-browser list | awk '$2=="verify"{print $1}')
-curl -s "http://127.0.0.1:$PORT/json" | python3 -c 'import sys,json;[print(t["title"],t["url"]) for t in json.load(sys.stdin)]'
+chad-browser eval 'return await evalInPage("document.title")'   # a logged-in title, not "Login"
 chad-browser down verify
 ```
 
-A logged-in title/URL (not a redirect to `/login`) means the carry-over worked.
+A logged-in title/URL (not a redirect to `/login`) means the carry-over worked. For a
+quick check without the driver, the raw CDP endpoint still works:
+
+```bash
+PORT=$(chad-browser list | awk '$2=="verify"{print $1}')
+curl -s "http://127.0.0.1:$PORT/json" | python3 -c 'import sys,json;[print(t["title"],t["url"]) for t in json.load(sys.stdin)]'
+```

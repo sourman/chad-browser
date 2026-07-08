@@ -7,16 +7,21 @@ Full reference for every `chad-browser` command, flag, and env var. Verified aga
 
 | Command | What it does |
 |---|---|
-| `up [opts] [URLs...] [-- chromium-flag...]` | Launch an isolated, pre-authenticated browser. |
-| `down <port\|name\|pid>` (`stop`) | Kill it + remove its ephemeral profile. |
-| `list` (`ls`) | Show running agent browsers. |
-| `cdp <port\|name\|pid>` (`ws`) | Print the browser's websocket endpoint. |
-| `gc` | Reap profiles whose process is gone + remove orphaned profile dirs. |
-| `info` | Print resolved BASE / BIN / RUNDIR / EPHEM / port range / headless / base-open state. |
+| `up [opts] [URLs...] [-- chromium-flag...]` | Launch an isolated, pre-authenticated browser + driver daemon. |
+| `down <port\|name\|pid>` (`stop`) | Kill browser + driver, remove ephemeral profile + socket. |
+| `list` (`ls`) | Show running agent browsers + driver state. |
+| `cdp <port\|name\|pid>` (`ws`) | Print the browser websocket endpoint (raw CDP fallback). |
+| `eval [--id <id>] '<js>'` | Run JS against the active page via the driver daemon. |
+| `script [--id <id>] <file.js>` | Run a JS file against the active page. |
+| `repl [--id <id>]` | Interactive JS prompt (line-buffered). |
+| `gc` | Reap profiles/sockets whose process is gone + remove orphans. |
+| `info` | Print resolved BASE / BIN / RUNDIR / SOCKDIR / DRIVER / NODE / port range. |
 | `--help` / `-h` / (no args) | Print the usage block. |
 
 IDs (`<port|name|pid>`) resolve in that order: an exact port runfile, then a matching
-`NAME=`, then a matching `PID=`.
+`NAME=`, then a matching `PID=`. For `eval`/`script`/`repl`, omitting `--id` resolves
+"my instance" by walking the process tree to find the instance whose launching shell
+is an ancestor of the current shell.
 
 ## `up` options
 
@@ -36,9 +41,35 @@ Baked-in Chromium flags (anti-throttle so agent-driven background tabs don't sta
 `--no-first-run --no-default-browser-check --no-pings --disable-background-timer-throttling
 --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=Translate`.
 
-`up` waits for CDP (`/json/version`) to come up; on failure it kills the process, removes
-the profile dir, and errors. On success it writes a runfile to `~/.cache/chad-browser/run/<port>.env`
-and prints `PORT= NAME= PID= HTTP= WS= PROFILE=`.
+`up` waits for CDP (`/json/version`) to come up, then spawns the driver daemon
+(`~/.local/lib/chad-browser/driver.mjs`) which connects to Chromium's WS endpoint,
+auto-enables `Page`/`Runtime`/`DOM`/`Network`, attaches to the first page target,
+and listens on a Unix socket at `$SOCKDIR/<name>.sock`. On success it writes a runfile
+to `~/.cache/chad-browser/run/<port>.env` and prints `PORT= NAME= PID= HTTP= WS= PROFILE= SOCKET=`.
+
+Wall-clock for `up` is typically 5-7s (profile clone + Chromium start + CDP wait + driver
+attach). It is not hung — the first launch of a session is slower because the base profile
+copy is cold; subsequent launches are faster.
+
+All commands exit 0 on success, non-zero on error. `list` exits 0 whether or not any
+instances are running; `down <id>` exits non-zero with a message if no instance matches
+the id (safe to re-run for cleanup retries — just check `$?` if you need to know).
+
+## `eval` / `script` / `repl`
+
+These send JS over the driver's Unix socket. The JS runs in a Node context with
+`session` (full CDP surface), `evalInPage`, `waitForReady`, `waitForDomStable`,
+`listPageTargets`, and `use` in scope. See `driving.md` for the full surface.
+
+```bash
+chad-browser eval 'return await evalInPage("document.title")'
+chad-browser eval --id myagent 'return 1 + 1'
+chad-browser script /tmp/flow.js
+chad-browser repl
+```
+
+The reply is a single JSON line: `{"value": <result>}` on success, `{"error": "...",
+"stack": "..."}` on failure.
 
 ## Environment variables
 
@@ -48,12 +79,16 @@ and prints `PORT= NAME= PID= HTTP= WS= PROFILE=`.
 | `CHAD_BROWSER_BIN` | `chromium` | Browser binary. **Use `chromium`, not `google-chrome`.** |
 | `CB_PORT_MIN` / `CB_PORT_MAX` | `9300` / `9499` | Port range for auto-pick. |
 | `CB_HEADLESS` | unset (headed) | Set `1` to default to headless. |
+| `XDG_RUNTIME_DIR` | `/run/user/<uid>` | Where the driver sockets live (`$XDG_RUNTIME_DIR/chad-browser/`). |
 
 ## Where things live
 
 - Base profile: `~/.config/chromium` (Ahmed's real logins — the source of truth).
+- Driver: `~/.local/lib/chad-browser/driver.mjs` (the CDP daemon spawned by `up`).
 - Runfiles (tracked instances): `~/.cache/chad-browser/run/<port>.env`.
 - Ephemeral profiles: `/tmp/chad-browser/<name>-<port>` (deleted on `down`).
+- Driver sockets: `$XDG_RUNTIME_DIR/chad-browser/<name>.sock` (deleted on `down`).
+- Driver logs: `~/.cache/chad-browser/<name>-driver.log` (for debugging launch failures).
 
 The base browser (Ahmed's, typically CDP `9222`) and `google-chrome` are unrelated and
 never touched.

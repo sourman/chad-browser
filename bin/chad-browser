@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+# chad-browser — isolated, ephemeral Chromium instances seeded from your testing base.
+#
+# The dream: every agent gets its OWN Chromium on its OWN port with its OWN throw-away
+# profile — but seeded from your base profile (~/.config/chromium) which already holds
+# your logins. No agent re-does auth; no two agents fight over the same port/tab/profile.
+#
+# Each `up` copies your base into a fresh --user-data-dir (WAL-safe on the live cookie
+# DBs) and opens CDP on 127.0.0.1 on a free port. `down` kills it and removes the dir.
+#
+# Uses `chromium` (NOT google-chrome — that stays your daily driver, untouched).
+#
+#   chad-browser up [opts] [URLs...] [-- chromium-flag...]
+#                                       launch an isolated, pre-authenticated browser
+#   chad-browser down <port|name|pid>   stop it + remove its ephemeral profile
+#   chad-browser list                   running agent browsers
+#   chad-browser cdp  <port|name|pid>   print the browser websocket endpoint
+#   chad-browser eval [--id <id>] '<js>'  run JS against the page via the driver
+#   chad-browser script [--id <id>] <f>   run a JS file against the page
+#   chad-browser repl [--id <id>]         interactive JS prompt
+#   chad-browser gc                     reap profiles whose process is gone
+#   chad-browser info                   resolved base/binary/port-range/driver
+#
+# up opts:
+#   --name NAME      label (default: chad-<port>)
+#   --port N         force a port (else first free in CB_PORT_MIN..MAX)
+#   --headless       no window (or set CB_HEADLESS=1)
+#   --headed         force a window (overrides CB_HEADLESS=1)
+#   --store STORE    --password-store value; default = inherit base (don't pass flag)
+#   --json           emit JSON instead of KEY=VAL
+#
+# Env: CHAD_BROWSER_BASE (default ~/.config/chromium)
+#      CHAD_BROWSER_BIN  (default chromium)
+#      CB_PORT_MIN / CB_PORT_MAX (default 9300 / 9499)
+#      CB_HEADLESS (default unset = headed)
+#
+# Distinct from the Vercel `agent-browser` npm package and from any IDE built-in
+# browser tool — this is a custom local bash script; nothing is installed via npm.
+
+set -uo pipefail
+
+BASE="${CHAD_BROWSER_BASE:-$HOME/.config/chromium}"
+BIN="${CHAD_BROWSER_BIN:-chromium}"
+CACHEDIR="${XDG_CACHE_HOME:-$HOME/.cache}/chad-browser"
+RUNDIR="$CACHEDIR/run"
+EPHEM_ROOT="${TMPDIR:-/tmp}/chad-browser"
+SOCKDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/chad-browser"
+# driver.mjs lives next to this script at <prefix>/lib/driver.mjs (consolidated
+# repo layout) or <prefix>/lib/chad-browser/driver.mjs (flat ~/.local layout).
+# Resolve through symlinks so a symlinked install finds the repo layout.
+_self_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [[ -f "$_self_dir/../lib/driver.mjs" ]]; then
+  DRIVER="$_self_dir/../lib/driver.mjs"
+elif [[ -f "$_self_dir/../lib/chad-browser/driver.mjs" ]]; then
+  DRIVER="$_self_dir/../lib/chad-browser/driver.mjs"
+elif [[ -f "$_self_dir/lib/chad-browser/driver.mjs" ]]; then
+  DRIVER="$_self_dir/lib/chad-browser/driver.mjs"
+else
+  DRIVER="$HOME/.local/lib/chad-browser/driver.mjs"
+fi
+CB_PORT_MIN="${CB_PORT_MIN:-9300}"
+CB_PORT_MAX="${CB_PORT_MAX:-9499}"
+
+die() { echo "chad-browser: $*" >&2; exit 1; }
+
+ensure_dirs() { mkdir -p "$CACHEDIR" "$RUNDIR" "$EPHEM_ROOT" "$SOCKDIR"; }
+
+# Copy the base profile into an ephemeral dir. The auth SQLite DBs are snapshotted with
+# `sqlite3 .backup` so a live base (rows still in *-wal) is captured consistently; their
+# -wal/-shm siblings are then dropped so Chromium opens a clean file.
+copy_base_to() {
+  local src=$1 dst=$2 db
+  cp -a "$src/Default" "$dst/Default"
+  cp -a "$src/Local State" "$dst/Local State" 2>/dev/null || true
+  [[ -e "$src/First Run" ]] && cp -a "$src/First Run" "$dst/First Run"
+  for db in Cookies "Login Data" "Login Data For Account"; do
+    [[ -f "$src/Default/$db" ]] || continue
+    if sqlite3 "$src/Default/$db" ".backup '$dst/Default/$db'" 2>/dev/null; then
+      rm -f "$dst/Default/$db-wal" "$dst/Default/$db-shm"
+    fi
+  done
+  strip_transient "$dst"
+}
+
+# Drop lock/session/cache files so the clone starts clean and never claims to be "in use".
+strip_transient() {
+  local root=$1 d
+  rm -f "$root"/SingletonLock "$root"/SingletonCookie "$root"/SingletonSocket \
+        "$root"/DevToolsActivePort "$root"/LOCK 2>/dev/null || true
+  d="$root/Default"; [[ -d "$d" ]] || return 0
+  rm -f "$d"/LOCK "$d"/LOG "$d"/LOG.old \
+        "$d"/"Current Session" "$d"/"Current Tabs" "$d"/"Last Session" "$d"/"Last Tabs" 2>/dev/null || true
+  rm -rf "$d"/Sessions "$d"/Cache "$d"/"Code Cache" "$d"/GPUCache \
+         "$d"/DawnGraphiteCache "$d"/DawnWebGPUCache "$d"/"Service Worker" \
+         "$d"/"Download Service" 2>/dev/null || true
+}
+
+pick_free_port() {
+  local p res
+  for ((p=CB_PORT_MIN; p<=CB_PORT_MAX; p++)); do
+    [[ -e "$RUNDIR/$p.env" ]] && continue
+    res=$(python3 - "$p" <<'PY' 2>/dev/null
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try: s.bind(("127.0.0.1", int(sys.argv[1]))); print("free")
+except OSError: print("busy")
+finally: s.close()
+PY
+)
+    [[ "$res" == "free" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+wait_for_cdp() {
+  local port=$1 i
+  for ((i=0; i<200; i++)); do
+    curl -fsS "http://127.0.0.1:$port/json/version" >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Wait for the driver's Unix socket to accept connections. The driver prints
+# "driver ready" to stdout once listening; we read until we see it (or timeout).
+wait_for_driver() {
+  local sock=$1 driver_pid=$2 i
+  for ((i=0; i<100; i++)); do
+    [[ -S "$sock" ]] && return 0
+    [[ -n "$driver_pid" ]] && ! kill -0 "$driver_pid" 2>/dev/null && return 1
+    sleep 0.1
+  done
+  return 1
+}
+
+ws_endpoint() { curl -fsS "http://127.0.0.1:$1/json/version" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["webSocketDebuggerUrl"])' 2>/dev/null; }
+
+resolve_id() {  # echo runfile path for port|name|pid
+  local id=$1 f
+  [[ -e "$RUNDIR/$id.env" ]] && { echo "$RUNDIR/$id.env"; return 0; }
+  for f in "$RUNDIR"/*.env; do
+    [[ -e "$f" ]] || continue
+    if grep -qE "^(NAME=$id|PID=$id)\$" "$f"; then echo "$f"; return 0; fi
+  done
+  return 1
+}
+
+cmd_up() {
+  local name="" port="" store="" json=0 urls=() raw=()
+  local headless=${CB_HEADLESS:-0}
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)  name=$2; shift 2;;
+      --port)  port=$2; shift 2;;
+      --store) store=$2; shift 2;;
+      --headless) headless=1; shift;;
+      --headed)   headless=0; shift;;
+      --json)  json=1; shift;;
+      --)      shift; raw=("$@"); break;;
+      -*)      die "unknown option '$1' (see: chad-browser --help)";;
+      *)       urls+=("$1"); shift;;
+    esac
+  done
+  ensure_dirs
+  [[ -d "$BASE/Default" ]] || die "base profile not found at $BASE (set CHAD_BROWSER_BASE)"
+  command -v "$BIN" >/dev/null 2>&1 || die "binary '$BIN' not found (set CHAD_BROWSER_BIN)"
+
+  [[ -n "$port" ]] || port=$(pick_free_port) || die "no free port in $CB_PORT_MIN-$CB_PORT_MAX (see: chad-browser list)"
+  [[ -e "$RUNDIR/$port.env" ]] && die "port $port already in use by a tracked browser"
+  [[ -z "$name" ]] && name="chad-$port"
+  # Name flows into a runfile that is `source`d, a socket path, and a profile dir
+  # that gets `rm -rf`d on down. Reject anything that isn't a safe label.
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+    || die "invalid --name '$name': use letters, digits, ., _, - (max 64 chars), starting alphanumeric"
+
+  # Reserve the port atomically before any slow work (profile copy, Chromium
+  # launch) so concurrent `up` calls don't double-allocate. The placeholder is
+  # overwritten with the full record once the browser + driver are up. If `up`
+  # fails after this point, the cleanup paths remove it.
+  cat > "$RUNDIR/$port.env" <<EOF
+PORT=$port
+NAME=$name
+PID=
+PROFILE=
+BASE=$BASE
+WS=
+SHELL_PID=$PPID
+DRIVER_PID=
+SOCKET=
+RESERVED=1
+EOF
+
+  local prof="$EPHEM_ROOT/$name-$port"
+  rm -rf "$prof"; mkdir -p "$prof"
+  copy_base_to "$BASE" "$prof"
+
+  local args=( --user-data-dir="$prof" --remote-debugging-port="$port"
+               --no-first-run --no-default-browser-check --no-pings
+               --disable-background-timer-throttling --disable-backgrounding-occluded-windows
+               --disable-renderer-backgrounding --disable-features=Translate )
+  [[ -n "$store" ]] && args+=( --password-store="$store" )
+  [[ $headless -eq 1 ]] && args+=( --headless=new )
+  [[ ${#raw[@]} -gt 0 ]] && args+=( "${raw[@]}" )
+  [[ ${#urls[@]} -gt 0 ]] && args+=( "${urls[@]}" )
+
+  "$BIN" "${args[@]}" >/dev/null 2>&1 &
+  local pid=$!
+  disown 2>/dev/null || true
+
+  if ! wait_for_cdp "$port"; then
+    pkill -f "user-data-dir=$prof" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
+    rm -rf "$prof" "$RUNDIR/$port.env"
+    die "Chromium CDP didn't come up on port $port"
+  fi
+  local ws; ws=$(ws_endpoint "$port")
+
+  # Spawn the driver daemon. It connects to Chromium's WS and serves JS eval
+  # over a Unix socket so the agent never touches CDP wiring directly.
+  local sock="$SOCKDIR/$name.sock"
+  rm -f "$sock"
+  local driver_log="$CACHEDIR/$name-driver.log"
+  if [[ -f "$DRIVER" ]]; then
+    node "$DRIVER" "$ws" "$sock" >"$driver_log" 2>&1 &
+    local driver_pid=$!
+    disown 2>/dev/null || true
+    if ! wait_for_driver "$sock" "$driver_pid"; then
+      pkill -f "user-data-dir=$prof" 2>/dev/null || true
+      kill -9 "$pid" 2>/dev/null || true
+      kill "$driver_pid" 2>/dev/null || true
+      rm -rf "$prof" "$sock" "$RUNDIR/$port.env"
+      die "driver daemon didn't come up (see $driver_log)"
+    fi
+  else
+    # Driver not installed — fall back to raw-CDP mode (WS still works).
+    driver_pid=""
+    sock=""
+  fi
+
+  # SHELL_PID records the launching shell (PPID, not $$ which is this script's
+  # own ephemeral PID) so per-shell instance resolution works: an agent's
+  # eval/script calls walk up their process tree and match this shell.
+  cat > "$RUNDIR/$port.env" <<EOF
+PORT=$port
+NAME=$name
+PID=$pid
+PROFILE=$prof
+BASE=$BASE
+WS=$ws
+SHELL_PID=$PPID
+DRIVER_PID=$driver_pid
+SOCKET=$sock
+EOF
+
+  if [[ $json -eq 1 ]]; then
+    python3 - "$port" "$name" "$pid" "$prof" "$ws" "$sock" "$driver_pid" <<'PY'
+import json, sys
+port, name, pid, prof, ws, sock, dpid = sys.argv[1:8]
+print(json.dumps({"port": int(port), "name": name, "pid": int(pid),
+                   "http": f"http://127.0.0.1:{port}", "ws": ws, "profile": prof,
+                   "socket": sock, "driver_pid": int(dpid) if dpid else None}))
+PY
+  else
+    echo "PORT=$port"
+    echo "NAME=$name"
+    echo "PID=$pid"
+    echo "HTTP=http://127.0.0.1:$port"
+    echo "WS=$ws"
+    echo "PROFILE=$prof"
+    [[ -n "$sock" ]] && echo "SOCKET=$sock"
+    echo
+    if [[ -n "$sock" ]]; then
+      echo "→ driver on $sock  (drive: chad-browser eval '<js>')"
+    else
+      echo "→ CDP live at http://127.0.0.1:$port  (driver not installed; raw CDP only)"
+    fi
+    echo "→ teardown: chad-browser down $name"
+  fi
+}
+
+cmd_down() {
+  local id=${1:-}; [[ -n "$id" ]] || die "usage: chad-browser down <port|name|pid>"
+  local f; f=$(resolve_id "$id") || die "no agent browser matching '$id'"
+  # shellcheck disable=SC1090
+  source "$f"
+  # Kill the driver first so eval calls fail fast rather than hang on the socket.
+  [[ -n "${DRIVER_PID:-}" ]] && kill "$DRIVER_PID" 2>/dev/null || true
+  [[ -n "${SOCKET:-}" ]] && rm -f "$SOCKET" 2>/dev/null || true
+  pkill -f "user-data-dir=$PROFILE" 2>/dev/null || true
+  kill "$PID" 2>/dev/null || true
+  local i
+  for ((i=0; i<40; i++)); do pgrep -f "user-data-dir=$PROFILE" >/dev/null 2>&1 || break; sleep 0.1; done
+  pkill -9 -f "user-data-dir=$PROFILE" 2>/dev/null || true
+  rm -rf "$PROFILE"; rm -f "$f"
+  echo "stopped $NAME (port $PORT)"
+}
+
+cmd_list() {
+  ensure_dirs
+  local f any=0
+  printf '%-6s %-18s %-8s %-6s %-7s %s\n' PORT NAME PID ALIVE DRIVER PROFILE
+  for f in "$RUNDIR"/*.env; do
+    [[ -e "$f" ]] || continue; any=1
+    # shellcheck disable=SC1090
+    ( source "$f"
+      local alive=no driver=no
+      kill -0 "$PID" 2>/dev/null && alive=yes
+      [[ -n "${DRIVER_PID:-}" ]] && kill -0 "$DRIVER_PID" 2>/dev/null && driver=yes
+      printf '%-6s %-18s %-8s %-6s %-7s %s\n' "$PORT" "$NAME" "$PID" "$alive" "$driver" "$PROFILE" ) || true
+  done
+  [[ $any -eq 0 ]] && echo "(none)"
+  return 0
+}
+
+cmd_cdp() {
+  local id=${1:-}; [[ -n "$id" ]] || die "usage: chad-browser cdp <port|name|pid>"
+  local f; f=$(resolve_id "$id") || die "no agent browser matching '$id'"
+  # shellcheck disable=SC1090
+  source "$f"
+  ws_endpoint "$PORT"
+}
+
+# Resolve "my" instance — the one whose launching shell is an ancestor of $$
+# (the current shell). Walks PPID up the tree. Falls back to the most recent
+# instance if exactly one exists. Errors if multiple candidates exist with no
+# ancestor match (ambiguous — name one explicitly).
+resolve_mine() {
+  local f shell_pid my_pid ppid_chain=()
+  my_pid=$$
+  # collect ancestor PIDs up the tree
+  local p=$my_pid
+  while [[ "$p" -gt 1 ]]; do
+    ppid_chain+=("$p")
+    p=$(awk '/^PPid:/{print $2}' /proc/$p/status 2>/dev/null) || break
+    [[ -z "$p" ]] && break
+  done
+  local matches=()
+  for f in "$RUNDIR"/*.env; do
+    [[ -e "$f" ]] || continue
+    shell_pid=$(grep -E '^SHELL_PID=' "$f" | cut -d= -f2)
+    [[ -z "$shell_pid" ]] && continue
+    for a in "${ppid_chain[@]}"; do
+      if [[ "$a" == "$shell_pid" ]]; then
+        matches+=("$f")
+        break
+      fi
+    done
+  done
+  if [[ ${#matches[@]} -eq 1 ]]; then echo "${matches[0]}"; return 0; fi
+  # no ancestor match — fall back to "only one running" heuristic
+  local all=()
+  for f in "$RUNDIR"/*.env; do [[ -e "$f" ]] && all+=("$f"); done
+  if [[ ${#all[@]} -eq 1 ]]; then echo "${all[0]}"; return 0; fi
+  if [[ ${#all[@]} -eq 0 ]]; then echo "no running chad-browser instances" >&2; return 1; fi
+  echo "multiple chad-browser instances running; name one explicitly:" >&2
+  for f in "${all[@]}"; do
+    # shellcheck disable=SC1090
+    ( source "$f"; echo "  $NAME (port $PORT)" ) >&2
+  done
+  return 1
+}
+
+resolve_socket() {
+  local id=${1:-} f
+  if [[ -z "$id" ]]; then f=$(resolve_mine) || die "specify an instance"
+  else f=$(resolve_id "$id") || die "no agent browser matching '$id'"; fi
+  # shellcheck disable=SC1090
+  source "$f"
+  [[ -n "${SOCKET:-}" && -S "$SOCKET" ]] || die "no driver socket for $NAME (driver not installed? raw CDP at http://127.0.0.1:$PORT)"
+  echo "$SOCKET"
+}
+
+# Send one JSON request over the Unix socket, read one newline-delimited response.
+# Usage: chad-browser eval [--id <name|port>] '<js>'
+cmd_eval() {
+  local id="" code=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id|-n) id=$2; shift 2;;
+      *)       code="$1"; shift;;
+    esac
+  done
+  [[ -n "$code" ]] || die "usage: chad-browser eval [--id <name|port|pid>] '<js>'"
+  local sock; sock=$(resolve_socket "$id") || exit 1
+  python3 - "$sock" "$code" <<'PY'
+import socket, json, sys
+sock_path, code = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(120)
+s.connect(sock_path)
+s.sendall((json.dumps({"eval": code}) + "\n").encode())
+buf = b""
+while b"\n" not in buf:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+sys.stdout.write(buf.decode() if buf else '{"error":"no response from driver"}\n')
+PY
+}
+
+# Like eval but reads the JS from a file (multi-line scripts).
+cmd_script() {
+  local id="" file=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id|-n) id=$2; shift 2;;
+      *)       file=$1; shift;;
+    esac
+  done
+  [[ -n "$file" ]] || die "usage: chad-browser script [--id <name|port|pid>] <file.js>"
+  [[ -f "$file" ]] || die "no such file: $file"
+  local code; code=$(<"$file")
+  cmd_eval "$id" "$code"
+}
+
+# Interactive REPL — line-buffered stdin → eval, one response per line.
+cmd_repl() {
+  local id=""
+  [[ "${1:-}" == "--id" || "${1:-}" == "-n" ]] && { id=$2; shift 2; }
+  local sock; sock=$(resolve_socket "$id") || exit 1
+  echo "chad-browser repl → $sock  (Ctrl-D to exit)"
+  local line
+  while IFS= read -r -e -p "> " line; do
+    [[ -z "$line" ]] && continue
+    cmd_eval "$id" "$line"
+  done
+  echo
+}
+
+cmd_gc() {
+  ensure_dirs
+  local f d
+  for f in "$RUNDIR"/*.env; do
+    [[ -e "$f" ]] || continue
+    # shellcheck disable=SC1090
+    (
+      source "$f"
+      if ! kill -0 "$PID" 2>/dev/null; then
+        [[ -n "${DRIVER_PID:-}" ]] && kill "$DRIVER_PID" 2>/dev/null || true
+        [[ -n "${SOCKET:-}" ]] && rm -f "$SOCKET" 2>/dev/null || true
+        rm -rf "$PROFILE"; rm -f "$f"
+        echo "reaped $NAME (port $PORT)"
+      fi
+    )
+  done
+  for d in "$EPHEM_ROOT"/*; do
+    [[ -d "$d" ]] || continue
+    if ! grep -qrF "PROFILE=$d" "$RUNDIR" 2>/dev/null; then rm -rf "$d"; echo "removed orphan $d"; fi
+  done
+}
+
+cmd_info() {
+  echo "BIN       $BIN -> $(command -v "$BIN" 2>/dev/null || echo MISSING)"
+  echo "BASE      $BASE"
+  echo "RUNDIR    $RUNDIR"
+  echo "EPHEM     $EPHEM_ROOT"
+  echo "SOCKDIR   $SOCKDIR"
+  echo "DRIVER    $DRIVER -> $([[ -f "$DRIVER" ]] && echo present || echo MISSING)"
+  echo "NODE      $(command -v node 2>/dev/null || echo MISSING)"
+  echo "PORTS     $CB_PORT_MIN-$CB_PORT_MAX"
+  echo "HEADLESS  ${CB_HEADLESS:-0 (headed by default)}"
+  echo "BASE OPEN $([[ -e "$BASE/DevToolsActivePort" || -L "$BASE/SingletonLock" ]] && echo yes || echo no)"
+}
+
+usage() {
+  sed -n '3,31p' "$0"
+}
+
+case "${1:-}" in
+  up)              shift; cmd_up "$@";;
+  down|stop)       shift; cmd_down "$@";;
+  list|ls)         shift; cmd_list "$@";;
+  cdp|ws)          shift; cmd_cdp "$@";;
+  eval)            shift; cmd_eval "$@";;
+  script)          shift; cmd_script "$@";;
+  repl)            shift; cmd_repl "$@";;
+  gc)              shift; cmd_gc "$@";;
+  info)            cmd_info;;
+  ""|-h|--help)    usage;;
+  *) die "unknown command '$1' (try: chad-browser --help)";;
+esac
