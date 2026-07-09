@@ -394,21 +394,35 @@ resolve_socket() {
 }
 
 # Send one JSON request over the Unix socket, read one newline-delimited response.
-# Usage: chad-browser eval [--id <name|port>] '<js>'
+# Usage: chad-browser eval [--id <name|port>] [--page] [--stdin|--file <f>|'<js>']
 cmd_eval() {
-  local id="" code="" timeout=""
+  local id="" code="" timeout="" page=0 from_stdin=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --id|-n) id=$2; shift 2;;
+      --id|--name|-n) id=$2; shift 2;;
       --timeout|-t) timeout=$2; shift 2;;
+      --page) page=1; shift;;
+      --stdin) from_stdin=1; shift;;
       --help|-h)
         cat <<'HELP'
-chad-browser eval [--id <name|port|pid>] [--timeout <ms>] '<js>'
+chad-browser eval [--id <name|port|pid>] [--timeout <ms>] [--page]
+                  [--stdin | --file <path> | '<js>']
 
-Runs <js> in a Node context connected to the page. The body is wrapped in an
-async function — use `await` freely and `return` the result.
+Runs JS connected to the page. The body is wrapped in an async function — use
+`await` freely and `return` the result.
 
-In scope (no imports needed):
+Modes (pick one source; default is the positional '<js>'):
+  '<js>'            inline JS body (one-liners only — shell-quoting gets hostile fast)
+  --file <path>     read JS from a file (or FIFO / process substitution)
+  --stdin           read JS from stdin (pipe a heredoc — zero escaping pain)
+
+Contexts:
+  default          run in the Node driver context with the full helper surface below.
+  --page           run in the PAGE context. `document.querySelector(...)` works directly.
+                   The body is auto-wrapped in evalInPage(() => { ... }) with IIFE detection.
+                   Combine with --stdin/--file for multi-statement page scripts.
+
+In scope (default Node context — no imports needed):
   session.<Domain>.<Method>(params)   full raw CDP surface
   evalInPage(jsExpr)                  Runtime.evaluate, returns value directly
   navigate(url, {timeout?, hint?})    Page.navigate + wait for readyState 'complete'
@@ -421,6 +435,8 @@ In scope (no imports needed):
   listPageTargets()                   page targets from Target.getTargets
   use(targetId)                       switch the active page target (iframes/tabs)
 
+In --page context the helpers are NOT in scope — only `document`, `window`, etc.
+
 Options:
   --timeout <ms>   eval body timeout in ms (default 120000; capped at 600000)
                    also sets the client socket timeout to match.
@@ -432,16 +448,37 @@ HELP
       *)       code="$1"; shift;;
     esac
   done
-  [[ -n "$code" ]] || die "usage: chad-browser eval [--id <name|port|pid>] [--timeout <ms>] '<js>'"
+  # Read JS from the chosen source.
+  if [[ $from_stdin -eq 1 ]]; then
+    code=$(cat)
+  fi
+  [[ -n "$code" ]] || die "usage: chad-browser eval [--id <name|port|pid>] [--page] [--timeout <ms>] (--stdin | --file <path> | '<js>')"
   local sock; sock=$(resolve_socket "$id") || exit 1
   local timeout_json=""
   if [[ -n "$timeout" ]]; then
     [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a number of ms"
     timeout_json=", \"timeout\": $timeout"
   fi
-  python3 - "$sock" "$code" "$timeout_json" <<'PY'
+  python3 - "$sock" "$code" "$timeout_json" "$page" <<'PY'
 import socket, json, sys
-sock_path, code, timeout_json = sys.argv[1], sys.argv[2], sys.argv[3]
+sock_path, code, timeout_json, page_flag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+
+if page_flag:
+    # Auto-IIFE: if the body isn't already a single expression we can pass
+    # verbatim to evalInPage, wrap it so `return` and multi-statement bodies work.
+    # evalInPage takes a single expression string; we detect "needs wrapping" by
+    # checking the body isn't already an IIFE / arrow / bare expression with no
+    # statement terminators. Simplest robust rule: if it contains ';' or 'return'
+    # or starts with '{', wrap in an IIFE.
+    stripped = code.strip()
+    needs_iife = (';' in stripped) or stripped.startswith('return') or stripped.startswith('{')
+    if needs_iife:
+        inner = code.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+        code = f'return evalInPage("(async () => {{ {inner} }})()")'
+    else:
+        inner = code.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+        code = f'return evalInPage("{inner}")'
+
 # Default client socket timeout 120s; if the caller set a body timeout, match it
 # (plus a 10s grace so the driver's own timeout error arrives before the socket's).
 client_timeout = 120
@@ -472,12 +509,14 @@ sys.stdout.write(buf.decode() if buf else '{"error":"no response from driver"}\n
 PY
 }
 
-# Like eval but reads the JS from a file (multi-line scripts).
+# Like eval but reads the JS from a file (multi-line scripts). Kept as a thin
+# alias over `eval --file` for backward compat — agents that learned the script
+# pattern keep working.
 cmd_script() {
   local id="" file="" timeout=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --id|-n) id=$2; shift 2;;
+      --id|--name|-n) id=$2; shift 2;;
       --timeout|-t) timeout=$2; shift 2;;
       *)       file=$1; shift;;
     esac
@@ -496,7 +535,9 @@ cmd_script() {
 # Interactive REPL — line-buffered stdin → eval, one response per line.
 cmd_repl() {
   local id=""
-  [[ "${1:-}" == "--id" || "${1:-}" == "-n" ]] && { id=$2; shift 2; }
+  case "${1:-}" in
+    --id|--name|-n) id=$2; shift 2;;
+  esac
   local sock; sock=$(resolve_socket "$id") || exit 1
   echo "chad-browser repl → $sock  (.exit or Ctrl-D to exit)"
   local line

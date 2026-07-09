@@ -1,8 +1,16 @@
 # chad-browser — driving the page
 
-The `eval` and `script` subcommands run JS in a Node context connected to one
-page target. The JS body is wrapped in an async function, so use `await` freely
-and **`return` the result**.
+The `eval` subcommand runs JS in one of two contexts:
+
+- **`--page`** — the JS runs in the page. `document.querySelector(...)` works directly.
+  The body is auto-wrapped in `evalInPage(() => { ... })()` with IIFE detection —
+  a bare expression returns its value; multi-statement bodies use `return`.
+- **default (Node)** — the JS runs in the driver's Node process with the full CDP
+  helper surface below in scope. The body is wrapped in an async function, so use
+  `await` freely and **`return` the result**.
+
+Both modes accept `--stdin` (pipe a heredoc) and `--file <path>` as alternatives to
+the inline positional `<js>` arg — use `--stdin` for anything with nested quotes.
 
 ## What's in scope
 
@@ -77,6 +85,19 @@ SPA route changes no longer detach you — but always follow a navigation with a
 
 ## Read DOM text
 
+The cleanest path is `--page --stdin` — the JS runs in the page directly, no
+`evalInPage` wrapper needed:
+
+```bash
+cat <<'JS' | chad-browser eval --name myagent --page --stdin
+const rows = [...document.querySelectorAll('table tbody tr')];
+return rows.map(r => r.textContent.trim());
+JS
+```
+
+From the Node context, the equivalent uses `evalInPage`. The expression must be a
+single expression — wrap multi-statement logic in an IIFE:
+
 ```js
 return await evalInPage(`
   (() => {
@@ -85,8 +106,6 @@ return await evalInPage(`
   })()
 `);
 ```
-
-The expression must be a single expression. Wrap multi-statement logic in an IIFE.
 
 ## Click
 
@@ -319,17 +338,30 @@ chad-browser eval 'const { data } = await session.Page.captureScreenshot({ forma
 
 ## Multi-step scripts
 
-For flows longer than a few lines, write to a file and use `script`:
+For flows longer than a few lines, pipe a heredoc to `--stdin` (preferred — no temp
+file, no shell-quoting pain):
+
+```bash
+cat <<'JS' | chad-browser eval --name myagent --stdin
+await navigate('https://example.com');
+await waitForReady({ check: 'document.readyState === "complete"', hint: 'load' });
+const title = await evalInPage('document.title');
+const links = await evalInPage('[...document.querySelectorAll("a")].map(a => a.href)');
+return { title, links };
+JS
+```
+
+Or write to a file and use `script` / `eval --file`:
 
 ```bash
 cat > /tmp/flow.js <<'EOF'
-await session.Page.navigate({ url: 'https://example.com' });
+await navigate('https://example.com');
 await waitForReady({ check: 'document.readyState === "complete"', hint: 'load' });
 const title = await evalInPage('document.title');
 const links = await evalInPage('[...document.querySelectorAll("a")].map(a => a.href)');
 return { title, links };
 EOF
-chad-browser script /tmp/flow.js
+chad-browser script --name myagent /tmp/flow.js
 ```
 
 ## Error handling

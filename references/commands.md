@@ -11,15 +11,16 @@ Full reference for every `chad-browser` command, flag, and env var. Verified aga
 | `down <port\|name\|pid>` (`stop`) | Kill browser + driver, remove ephemeral profile + socket. |
 | `list` (`ls`) | Show running agent browsers + driver state. |
 | `cdp <port\|name\|pid>` (`ws`) | Print the browser websocket endpoint (raw CDP fallback). |
-| `eval [--id <id>] '<js>'` | Run JS against the active page via the driver daemon. |
-| `script [--id <id>] <file.js>` | Run a JS file against the active page. |
-| `repl [--id <id>]` | Interactive JS prompt (line-buffered). |
+| `eval [--id\|--name <id>] [--page] [--stdin\|--file <f>\|'<js>']` | Run JS against the page. |
+| `script [--id\|--name <id>] <file.js>` | Run a JS file (alias for `eval --file`). |
+| `repl [--id\|--name <id>]` | Interactive JS prompt (line-buffered). |
 | `gc` | Reap profiles/sockets whose process is gone + remove orphans. |
 | `info` | Print resolved BASE / BIN / RUNDIR / SOCKDIR / DRIVER / NODE / port range. |
 | `--help` / `-h` / (no args) | Print the usage block. |
 
 IDs (`<port|name|pid>`) resolve in that order: an exact port runfile, then a matching
-`NAME=`, then a matching `PID=`. For `eval`/`script`/`repl`, omitting `--id` resolves
+`NAME=`, then a matching `PID=`. `--id` and `--name` are aliases on every driving
+subcommand — use whichever you like. For `eval`/`script`/`repl`, omitting both resolves
 "my instance" by walking the process tree to find the instance whose launching shell
 is an ancestor of the current shell.
 
@@ -58,15 +59,36 @@ the id (safe to re-run for cleanup retries — just check `$?` if you need to kn
 
 ## `eval` / `script` / `repl`
 
-These send JS over the driver's Unix socket. The JS runs in a Node context with
-`session` (full CDP surface), `evalInPage`, `waitForReady`, `waitForDomStable`,
-`listPageTargets`, and `use` in scope. See `driving.md` for the full surface.
+These send JS over the driver's Unix socket. `eval` is the primary interface; `script`
+is a backward-compat alias for `eval --file`; `repl` is an interactive loop.
+
+### `eval` flags
+
+| Flag | Effect |
+|---|---|
+| `--id\|--name <id>` | Target instance (alias; either works). Omit to auto-resolve "my instance." |
+| `--page` | Run JS in the page's context. `document.*` works directly. Multi-statement bodies auto-IIFE. |
+| `--stdin` | Read JS from stdin (pipe a heredoc — the recommended default for multi-line). |
+| `--file <path>` | Read JS from a file or FIFO. |
+| `--timeout <ms>` | Eval body timeout (default 120000, capped 600000). Also sets socket timeout. |
+
+If no `--stdin`/`--file` is given, the positional `<js>` arg is the body.
 
 ```bash
-chad-browser eval 'return await evalInPage("document.title")'
-chad-browser eval --id myagent 'return 1 + 1'
-chad-browser script /tmp/flow.js
-chad-browser repl
+# Page-context read (one-liner)
+chad-browser eval --name myagent --page 'document.title'
+
+# Page-context read (multi-line via heredoc — zero quoting pain)
+cat <<'JS' | chad-browser eval --name myagent --page --stdin
+const rows = [...document.querySelectorAll('table tbody tr')];
+return rows.map(r => r.textContent.trim());
+JS
+
+# Node context (CDP helpers in scope)
+chad-browser eval --name myagent 'return await evalInPage("document.title")'
+
+# From a file
+chad-browser script --name myagent /tmp/flow.js
 ```
 
 The reply is a single JSON line: `{"value": <result>}` on success, `{"error": "...",

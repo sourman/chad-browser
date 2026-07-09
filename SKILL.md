@@ -24,17 +24,61 @@ built-in browser tool is available, use chad-browser instead.
 ## The core loop
 
 ```bash
-chad-browser up  --name myagent https://app.example.com   # launch + driver, auth already there
-chad-browser eval 'return await evalInPage("document.title")'         # drive the page
-chad-browser eval 'return await evalInPage("location.href")'          # drive again
-chad-browser down myagent                                            # tear down + delete profile
+# 1. Launch — auth carries over from the base profile
+chad-browser up --name myagent --headless https://app.example.com
+
+# 2. Read a fact off the page — --page runs JS in the page directly, --stdin avoids shell-quoting hell
+cat <<'JS' | chad-browser eval --name myagent --page --stdin
+const title = document.title;
+const h1 = document.querySelector('h1')?.textContent;
+return { title, h1 };
+JS
+
+# 3. Tear down
+chad-browser down myagent
 ```
+
+**Two flags eliminate the three footguns agents hit most:**
+
+- **`--name`** works on every subcommand (it's an alias for `--id`). Launch with
+  `--name foo`, drive with `--name foo` — no flag asymmetry to discover by failing.
+- **`--page`** runs the JS body in the page's context. `document.querySelector(...)`
+  works directly — no `evalInPage` wrapper, no Node-vs-page confusion. Multi-statement
+  bodies are auto-wrapped in an IIFE for you.
+- **`--stdin`** reads the JS from a piped heredoc. No shell-quoting pain: mix single
+  and double quotes freely inside the heredoc. This is the **recommended default** for
+  anything beyond a one-liner.
 
 `up` prints `PORT=` / `NAME=` / `PID=` / `HTTP=` / `WS=` / `PROFILE=` / `SOCKET=`.
 
+### When to use which mode
+
+| You want to… | Use |
+|---|---|
+| Read a fact off a page (title, text, count) | `eval --name X --page --stdin` with a heredoc |
+| Navigate + wait + read in one flow | `eval --name X --stdin` (Node context, has `navigate()`, `waitForReady()`, `evalInPage()`) |
+| Drive a one-liner inline | `eval --name X --page 'document.title'` |
+| Run a saved `.js` file | `script --name X /tmp/flow.js` (or `eval --name X --file /tmp/flow.js`) |
+| Full CDP surface (network interception, screenshots, iframes) | `eval --name X --stdin` — the `session.*` surface and all helpers are in scope |
+
 ## Driving the page
 
-`eval` runs JS in a Node context where these are in scope:
+There are two execution contexts, picked by flag:
+
+- **`--page`** — JS runs in the page. `document`, `window`, etc. work directly.
+  No `return` needed for a bare expression; multi-statement bodies auto-IIFE.
+  Use for reading DOM content. Combine with `--stdin` to avoid shell-quoting.
+- **default (Node context)** — JS runs in the driver's Node process with the full
+  CDP helper surface in scope (`session.*`, `navigate`, `typeInto`, `waitForReady`,
+  `evalInPage`, etc.). Use for navigation, clicks, form fills, network interception —
+  anything that needs CDP, not just reading.
+
+**Inline vs stdin:** `eval '<js>'` is fine for one-liners. For anything with nested
+quotes (a `querySelector("a[href*=\"/x\"]")` or a `waitForReady({check:"..."})`),
+use `--stdin` with a heredoc — shell-quoting of nested JS quotes is unwinnable and
+the #1 source of wasted turns. `script <file>` remains as an alias for `eval --file`.
+
+The Node context exposes:
 
 - **`session.<Domain>.<Method>(params)`** — the full raw CDP surface. Any CDP method
   works: `session.Page.navigate(...)`, `session.Runtime.evaluate(...)`,
@@ -77,24 +121,42 @@ Long-running flows can raise the 120s default body timeout with `--timeout <ms>`
 
 ### Reading page content safely
 
-```js
-// Wait for hydration, then read. The hint makes timeouts debuggable.
+SPAs render skeleton/spinner placeholders before the real data. Wait for hydration,
+then read. The `--page --stdin` form is the cleanest for multi-line reads:
+
+```bash
+# Navigate + wait in Node context, then read in page context.
+cat <<'JS' | chad-browser eval --name myagent --stdin
+await navigate('https://app.example.com/policies');
 await waitForReady({
   check: 'document.querySelectorAll("table tbody tr").length > 0 && document.querySelectorAll(".MuiSkeleton, [role=progressbar]").length === 0',
   timeout: 10000,
   hint: 'policy table hydration (rows present, no skeletons)',
 });
 return await evalInPage('document.querySelector("h1").textContent');
+JS
+```
+
+For a pure page-context read (no CDP helpers needed), `--page --stdin` skips the
+`evalInPage` wrapper entirely:
+
+```bash
+cat <<'JS' | chad-browser eval --name myagent --page --stdin
+const rows = [...document.querySelectorAll('table tbody tr')];
+return { count: rows.length, first: rows[0]?.textContent.trim() };
+JS
 ```
 
 ### Filling React-controlled inputs
 
-React ignores direct `.value =` assignment. Use CDP's `Input.insertText`:
+Use the `typeInto` helper (focus + select-all + delete + insertText) — it replaces
+the field value and works on React-controlled inputs:
 
-```js
-await evalInPage('document.querySelector("input[placeholder*=Search]").focus()');
-await session.Input.insertText({ text: 'HIPAA' });
-return await evalInPage('document.querySelector("input[placeholder*=Search]").value');
+```bash
+cat <<'JS' | chad-browser eval --name myagent --stdin
+const v = await typeInto('input[placeholder*="Search"]', 'HIPAA');
+return v;
+JS
 ```
 
 For per-keystroke behavior (dropdowns that filter on each char), use
@@ -125,8 +187,10 @@ relying on a detail:
 4. **Wait for hydration before reading.** SPAs show skeleton placeholders before the
    real data. If `evalInPage` returns empty rows or a count looks wrong, you read too
    early — call `waitForReady` / `waitForDomStable` and retry.
-5. **Always `return` from `eval`.** No `return` means no value in the reply. The JS
-   body is wrapped in an async function; use `await` freely.
+5. **`return` from `eval` (Node context).** In the default Node context, no
+   `return` means no value in the reply. The JS body is wrapped in an async function;
+   use `await` freely. In `--page` mode, a bare expression returns its value
+   automatically; multi-statement bodies still need `return`.
 6. **CDP events are not methods.** `session.Network.requestWillBeSent(...)` is a bug —
    that's an *event* name. Subscribe with `onEvent(...)` or use `captureRequests(...)`.
    The read domains (`Page`/`Runtime`/`DOM`/`Network`) are auto-enabled on attach; don't
