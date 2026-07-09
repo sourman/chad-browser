@@ -17,8 +17,9 @@ the inline positional `<js>` arg — use `--stdin` for anything with nested quot
 | Name | What it does |
 |---|---|
 | `session.<Domain>.<Method>(params)` | Full raw CDP surface. `session.Page.navigate(...)`, `session.Runtime.evaluate(...)`, `session.Input.insertText(...)`, etc. Domain/method names map 1:1 to CDP. |
-| `evalInPage(jsExpr)` | `Runtime.evaluate` with `returnByValue:true, awaitPromise:true`. Returns the value directly. The expression runs in the page's JS context. |
+| `evalInPage(jsExprOrFn)` | `Runtime.evaluate` with `returnByValue:true, awaitPromise:true`. Accepts **either** a string expression **or** an arrow function (preferred — no quoting hell). Returns the value directly. The expression runs in the page's JS context. |
 | `navigate(url, { timeout?, hint? })` | `Page.navigate` + wait for `readyState === 'complete'`. Preferred over the raw two-step — eliminates the #1 wrong-answer source (reading mid-hydration after a nav). |
+| `waitForNavigation({ timeout?, hint? }, trigger)` | Arm a `Page.frameNavigated` listener, run `trigger` (e.g. a form submit or button click that causes a server-side navigation), then wait for the destination to settle. Returns the destination URL. Solves the read-after-submit pattern. |
 | `typeInto(selector, text, { delay? })` | Focus a field, select-all, delete, then `Input.insertText`. **Replaces** the value (unlike raw `insertText`, which appends). Works on React-controlled inputs. Throws clearly on readonly/disabled/hidden/contenteditable. Returns the field's new value. |
 | `resetInterception()` | Disable `Fetch`/`Network.setRequestInterception`. Call after traffic-interception experiments (blocking/mocking) so the loader doesn't stay wedged. Safe when no interception is active. |
 | `waitForReady({ check, timeout?, hint? })` | Poll a JS expression (in the page) until it returns truthy. Default timeout 10s, interval 300ms. `hint` is a human label included in the timeout error. If `check` itself throws, the error is surfaced immediately. |
@@ -148,28 +149,49 @@ const newVal = await typeInto('input[placeholder*="Search"]', 'HIPAA');
 return newVal;
 ```
 
-Plain HTML inputs — set `.value` and dispatch `input` (only if you need the
-manual form):
+**Form submit + read the result page.** When a form submit triggers a
+server-side navigation, use `waitForNavigation` to arm a listener *before* the
+submit, then read the destination page once it settles — no blind polling:
 
 ```js
-await evalInPage(`
-  const i = document.querySelector('input[name=q]');
-  i.value = 'search term';
-  i.dispatchEvent(new Event('input', { bubbles: true }));
-`);
+// Navigate to the form page FIRST, outside waitForNavigation.
+await navigate('https://example.com/login', { hint: '#username' });
+const dest = await waitForNavigation(
+  { hint: 'login result' },
+  async () => {
+    await typeInto('#username', 'wronguser');
+    await typeInto('#password', 'wrongpass');
+    await evalInPage('document.querySelector("form").submit()');
+  },
+);
+// dest is the destination URL; page is ready for reads.
+const result = await evalInPage(() => ({
+  url: location.href,
+  hasError: !!document.querySelector('.alert-danger'),
+  bodyText: document.body.innerText.substring(0, 500),
+}));
+return { dest, ...result };
 ```
 
-React-controlled inputs — React ignores `.value =`. The manual form is focus +
-`Input.insertText` (note: this **appends** — clear first, or use `typeInto`):
+> **Don't `navigate()` inside the `waitForNavigation` trigger.** `navigate()`
+> itself fires `Page.frameNavigated`, which the listener will catch as the
+> "navigation" and return early — before your submit even runs. Navigate to the
+> form page first, then arm the listener around just the submit action.
 
-```js
-await evalInPage('document.querySelector("input[placeholder*=Search]").focus()');
-await session.Input.insertText({ text: 'HIPAA' });
-// If insertText doesn't trigger the React onChange (some controlled inputs reject it),
-// fall back to per-character key events:
-// await session.Input.dispatchKeyEvent({ type: 'keyDown', key: 'Backspace' });
-// for (const ch of 'HIPAA') await session.Input.dispatchKeyEvent({ type: 'char', text: ch });
-```
+> **`evalInPage` accepts an arrow function.** The quoting of nested strings and
+> regexes inside `evalInPage('...')` is painful (you have to double-escape).
+> Pass an arrow function instead — it runs in the page with native quoting:
+>
+> ```js
+> // Painful: nested quotes, double-escaped regex
+> await evalInPage('(() => { const m = document.body.innerHTML.match(/<a[^>]*href="([^"]*)"/); return m ? m[1] : null; })()');
+>
+> // Clean: arrow function, native quoting
+> await evalInPage(() => {
+>   const m = document.body.innerHTML.match(/<a[^>]*href="([^"]*)"/);
+>   return m ? m[1] : null;
+> });
+> ```
 
 > **Selector tip:** don't copy selectors from docs verbatim — sites change.
 > Verify a selector exists with `evalInPage('document.querySelector("...")?.tagName')`

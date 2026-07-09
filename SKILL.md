@@ -92,8 +92,11 @@ The Node context exposes:
   `session.Target.attachToTarget(...)`. The domain surface is generated at runtime
   from the method name, so it's always in sync with whatever Chromium version is
   installed — no stale vendored bindings.
-- **`evalInPage(jsExpression)`** — shortcut for `Runtime.evaluate` with
+- **`evalInPage(jsExprOrFn)`** — shortcut for `Runtime.evaluate` with
   `returnByValue: true` and `awaitPromise: true`. Returns the value directly.
+  Accepts **either** a string expression **or** an arrow function — prefer the
+  arrow function form (`evalInPage(() => ...[])`) to avoid quoting hell with
+  nested strings/regexes.
 - **`waitForReady({ check, timeout?, hint? })`** — poll a JS expression in the page
   until it returns truthy. **Use this before reading a page's content** — SPAs
   render skeleton/spinner placeholders for 1-3s before the real data hydrates, and
@@ -101,6 +104,10 @@ The Node context exposes:
 - **`waitForDomStable({ timeout?, hint? })`** — default check: waits until
   `document.querySelectorAll('*').length` is unchanged across two polls AND no
   skeleton/spinner selectors remain. Use when you don't know the framework.
+- **`waitForNavigation({ timeout?, hint? }, trigger)`** — arm a navigation
+  listener, run `trigger` (a form submit or click that causes a server-side
+  navigation), then wait for the destination to settle. Returns the destination
+  URL. Use this for read-after-submit flows instead of polling blindly.
 - **`listPageTargets()`** — returns page targets (for `Target.attachToTarget`).
 - **`use(targetId)`** — switch the active page target (e.g. for cross-origin iframes).
 - **`navigate(url, { timeout?, hint? })`** — `Page.navigate` + wait for

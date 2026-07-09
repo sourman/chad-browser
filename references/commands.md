@@ -89,6 +89,22 @@ chad-browser eval --name myagent --page 'document.title'
 # Node context (CDP helpers in scope)
 chad-browser eval --name myagent 'return await evalInPage("document.title")'
 
+# Node context with an arrow function (avoids quoting hell for nested strings/regex)
+cat <<'JS' | chad-browser eval --name myagent --stdin
+return await evalInPage(() => document.title);
+JS
+
+# Read-after-submit: arm nav listener, submit, read destination
+cat <<'JS' | chad-browser eval --name myagent --stdin
+const dest = await waitForNavigation({ hint: 'login result' }, async () => {
+  await typeInto('#username', 'me');
+  await typeInto('#password', 'pw');
+  await evalInPage('document.querySelector("form").submit()');
+});
+const body = await evalInPage(() => document.body.innerText.substring(0, 500));
+return { dest, body };
+JS
+
 # From a file
 chad-browser script --name myagent /tmp/flow.js
 ```
