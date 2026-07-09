@@ -419,7 +419,7 @@ resolve_socket() {
   source "$f"
   # Safety guard: never let an agent drive an externally-attached browser (e.g. the
   # daily-driver 9222 "attach"). These have an empty PROFILE (not spawned by us).
-  # Driving them executes JS in Ahmed's real browser — reading real sessions,
+  # Driving them executes JS in the user's real browser — reading real sessions,
   # triggering real actions. That violates the tool's isolation premise.
   if [[ -z "${PROFILE:-}" || "$PROFILE" != "$EPHEM_ROOT"/* ]]; then
     die "refusing to drive '$NAME': it is an externally-attached browser (not a chad-browser-spawned instance). Use a spawned instance instead."

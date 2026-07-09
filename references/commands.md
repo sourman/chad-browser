@@ -124,12 +124,12 @@ The reply is a single JSON line: `{"value": <result>}` on success, `{"error": ".
 
 ## Where things live
 
-- Base profile: `~/.config/chromium` (Ahmed's real logins — the source of truth).
+- Base profile: `~/.config/chromium` (the user's real logins — the source of truth).
 - Driver: `~/.local/lib/chad-browser/driver.mjs` (the CDP daemon spawned by `up`).
 - Runfiles (tracked instances): `~/.cache/chad-browser/run/<port>.env`.
 - Ephemeral profiles: `/tmp/chad-browser/<name>-<port>` (deleted on `down`).
 - Driver sockets: `$XDG_RUNTIME_DIR/chad-browser/<name>.sock` (deleted on `down`).
 - Driver logs: `~/.cache/chad-browser/<name>-driver.log` (for debugging launch failures).
 
-The base browser (Ahmed's, typically CDP `9222`) and `google-chrome` are unrelated and
-never touched.
+The base browser (the user's daily browser, typically CDP `9222`) and `google-chrome` are
+unrelated and never touched.

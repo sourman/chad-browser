@@ -6,7 +6,7 @@ each silently broken things. Read before deviating from defaults.
 ## How auth carries over
 
 `chad-browser up` copies the base profile (`~/.config/chromium`) into a fresh
-`--user-data-dir` so the clone opens already logged in to everything Ahmed is. The
+`--user-data-dir` so the clone opens already logged in to everything the base user is. The
 copy is **not** a naive `cp`:
 
 - `cp -a` of `Default/` and `Local State` (and `First Run` if present).
