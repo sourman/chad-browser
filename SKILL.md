@@ -27,27 +27,29 @@ built-in browser tool is available, use chad-browser instead.
 # 1. Launch — auth carries over from the base profile
 chad-browser up --name myagent --headless https://app.example.com
 
-# 2. Read a fact off the page — --page runs JS in the page directly, --stdin avoids shell-quoting hell
-cat <<'JS' | chad-browser eval --name myagent --page --stdin
-const title = document.title;
-const h1 = document.querySelector('h1')?.textContent;
-return { title, h1 };
+# 2. Read a hydrated fact off the page — --wait polls first, --page runs JS in the page, --stdin avoids quoting hell
+cat <<'JS' | chad-browser eval --name myagent --page --wait 'document.querySelector("table tbody tr")' --stdin
+const rows = [...document.querySelectorAll('table tbody tr')];
+return { count: rows.length, first: rows[0]?.textContent.trim() };
 JS
 
 # 3. Tear down
 chad-browser down myagent
 ```
 
-**Two flags eliminate the three footguns agents hit most:**
+**The four flags that eliminate agent friction:**
 
-- **`--name`** works on every subcommand (it's an alias for `--id`). Launch with
-  `--name foo`, drive with `--name foo` — no flag asymmetry to discover by failing.
+- **`--name`** works on every subcommand (alias for `--id`). Launch with `--name foo`,
+  drive with `--name foo` — no flag asymmetry to discover by failing.
 - **`--page`** runs the JS body in the page's context. `document.querySelector(...)`
   works directly — no `evalInPage` wrapper, no Node-vs-page confusion. Multi-statement
   bodies are auto-wrapped in an IIFE for you.
+- **`--wait '<check>'`** polls a page JS expression until truthy, THEN runs the body.
+  Composes with `--page` — kills the most-repeated boilerplate
+  (`await waitForDomStable(...); return await evalInPage(...)`).
 - **`--stdin`** reads the JS from a piped heredoc. No shell-quoting pain: mix single
-  and double quotes freely inside the heredoc. This is the **recommended default** for
-  anything beyond a one-liner.
+  and double quotes freely inside the heredoc. The **recommended default** for anything
+  beyond a one-liner.
 
 `up` prints `PORT=` / `NAME=` / `PID=` / `HTTP=` / `WS=` / `PROFILE=` / `SOCKET=`.
 
@@ -55,11 +57,14 @@ chad-browser down myagent
 
 | You want to… | Use |
 |---|---|
-| Read a fact off a page (title, text, count) | `eval --name X --page --stdin` with a heredoc |
-| Navigate + wait + read in one flow | `eval --name X --stdin` (Node context, has `navigate()`, `waitForReady()`, `evalInPage()`) |
+| **Read a hydrated SPA** (the common case) | `eval --name X --page --wait '<selector>' --stdin` |
+| Read a fact off a static page (already loaded) | `eval --name X --page --stdin` |
+| Navigate + multi-step flow (clicks, forms) | `eval --name X --stdin` (Node context, has `navigate()`, `typeInto()`, `session.*`) |
 | Drive a one-liner inline | `eval --name X --page 'document.title'` |
-| Run a saved `.js` file | `script --name X /tmp/flow.js` (or `eval --name X --file /tmp/flow.js`) |
-| Full CDP surface (network interception, screenshots, iframes) | `eval --name X --stdin` — the `session.*` surface and all helpers are in scope |
+| Run a saved `.js` file | `script --name X /tmp/flow.js` |
+| Full CDP surface (network interception, screenshots, iframes) | `eval --name X --stdin` — `session.*` and all helpers are in scope |
+| Find which localhost port the dev server is on | `chad-browser probe 'http://localhost:{8080..8090}/'` |
+| See running instances + copy-pasteable drive hints | `chad-browser list` |
 
 ## Driving the page
 
@@ -67,7 +72,8 @@ There are two execution contexts, picked by flag:
 
 - **`--page`** — JS runs in the page. `document`, `window`, etc. work directly.
   No `return` needed for a bare expression; multi-statement bodies auto-IIFE.
-  Use for reading DOM content. Combine with `--stdin` to avoid shell-quoting.
+  Use for reading DOM content. Combine with `--stdin` to avoid shell-quoting, and
+  `--wait '<check>'` to hydrate first.
 - **default (Node context)** — JS runs in the driver's Node process with the full
   CDP helper surface in scope (`session.*`, `navigate`, `typeInto`, `waitForReady`,
   `evalInPage`, etc.). Use for navigation, clicks, form fills, network interception —
@@ -121,11 +127,24 @@ Long-running flows can raise the 120s default body timeout with `--timeout <ms>`
 
 ### Reading page content safely
 
-SPAs render skeleton/spinner placeholders before the real data. Wait for hydration,
-then read. The `--page --stdin` form is the cleanest for multi-line reads:
+SPAs render skeleton/spinner placeholders before the real data. **Always wait for
+hydration before reading** — reading too early is the #1 source of wrong answers
+(empty rows, undercounted results, stale counts).
+
+The canonical pattern is `--page --wait --stdin` — the `--wait` polls until the
+content selector is truthy, then `--page` runs the read body in the page directly:
 
 ```bash
-# Navigate + wait in Node context, then read in page context.
+cat <<'JS' | chad-browser eval --name myagent --page --wait 'document.querySelector("table tbody tr")' --stdin
+const rows = [...document.querySelectorAll('table tbody tr')];
+return { count: rows.length, first: rows[0]?.textContent.trim() };
+JS
+```
+
+For a navigation + read flow (where you need the `navigate()` helper), use Node
+context with `--stdin`:
+
+```bash
 cat <<'JS' | chad-browser eval --name myagent --stdin
 await navigate('https://app.example.com/policies');
 await waitForReady({
@@ -134,16 +153,6 @@ await waitForReady({
   hint: 'policy table hydration (rows present, no skeletons)',
 });
 return await evalInPage('document.querySelector("h1").textContent');
-JS
-```
-
-For a pure page-context read (no CDP helpers needed), `--page --stdin` skips the
-`evalInPage` wrapper entirely:
-
-```bash
-cat <<'JS' | chad-browser eval --name myagent --page --stdin
-const rows = [...document.querySelectorAll('table tbody tr')];
-return { count: rows.length, first: rows[0]?.textContent.trim() };
 JS
 ```
 

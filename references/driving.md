@@ -39,6 +39,18 @@ SPAs render skeleton/spinner placeholders for 1-3s before the real data. Reading
 too early is the #1 source of wrong answers (empty rows, undercounted results,
 stale counts). **Wait before you read.**
 
+The `--wait` flag is the one-shot form — it polls a page JS expression until truthy,
+then runs the body:
+
+```bash
+cat <<'JS' | chad-browser eval --name myagent --page --wait 'document.querySelectorAll("table tbody tr").length > 0' --stdin
+const rows = [...document.querySelectorAll('table tbody tr')];
+return rows.map(r => r.textContent.trim());
+JS
+```
+
+From the Node context, the equivalent is `waitForReady` / `waitForDomStable`:
+
 ```js
 // Explicit check — you know what "ready" means for this page.
 await waitForReady({
@@ -85,11 +97,11 @@ SPA route changes no longer detach you — but always follow a navigation with a
 
 ## Read DOM text
 
-The cleanest path is `--page --stdin` — the JS runs in the page directly, no
-`evalInPage` wrapper needed:
+The cleanest path is `--page --wait --stdin` — the wait hydrates, then the body runs
+in the page directly, no `evalInPage` wrapper needed:
 
 ```bash
-cat <<'JS' | chad-browser eval --name myagent --page --stdin
+cat <<'JS' | chad-browser eval --name myagent --page --wait 'document.querySelector("table tbody tr")' --stdin
 const rows = [...document.querySelectorAll('table tbody tr')];
 return rows.map(r => r.textContent.trim());
 JS

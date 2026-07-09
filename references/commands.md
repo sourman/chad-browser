@@ -15,6 +15,7 @@ Full reference for every `chad-browser` command, flag, and env var. Verified aga
 | `script [--id\|--name <id>] <file.js>` | Run a JS file (alias for `eval --file`). |
 | `repl [--id\|--name <id>]` | Interactive JS prompt (line-buffered). |
 | `gc` | Reap profiles/sockets whose process is gone + remove orphans. |
+| `probe <url>` | Probe a URL (supports `{8080..8090}` ranges / `{8080,8081}` lists) for a live HTTP server. Prints `<code> <url>` on the first responder. Use to find which localhost port the dev server is on. |
 | `info` | Print resolved BASE / BIN / RUNDIR / SOCKDIR / DRIVER / NODE / port range. |
 | `--help` / `-h` / (no args) | Print the usage block. |
 
@@ -68,6 +69,7 @@ is a backward-compat alias for `eval --file`; `repl` is an interactive loop.
 |---|---|
 | `--id\|--name <id>` | Target instance (alias; either works). Omit to auto-resolve "my instance." |
 | `--page` | Run JS in the page's context. `document.*` works directly. Multi-statement bodies auto-IIFE. |
+| `--wait '<check>'` | Poll a page JS expression until truthy, THEN run the body. Composes with `--page`. Default 15s timeout. |
 | `--stdin` | Read JS from stdin (pipe a heredoc — the recommended default for multi-line). |
 | `--file <path>` | Read JS from a file or FIFO. |
 | `--timeout <ms>` | Eval body timeout (default 120000, capped 600000). Also sets socket timeout. |
@@ -75,14 +77,14 @@ is a backward-compat alias for `eval --file`; `repl` is an interactive loop.
 If no `--stdin`/`--file` is given, the positional `<js>` arg is the body.
 
 ```bash
-# Page-context read (one-liner)
-chad-browser eval --name myagent --page 'document.title'
-
-# Page-context read (multi-line via heredoc — zero quoting pain)
-cat <<'JS' | chad-browser eval --name myagent --page --stdin
+# The common case: hydrate then read, in one call
+cat <<'JS' | chad-browser eval --name myagent --page --wait 'document.querySelector("table tbody tr")' --stdin
 const rows = [...document.querySelectorAll('table tbody tr')];
 return rows.map(r => r.textContent.trim());
 JS
+
+# Page-context read (one-liner)
+chad-browser eval --name myagent --page 'document.title'
 
 # Node context (CDP helpers in scope)
 chad-browser eval --name myagent 'return await evalInPage("document.title")'

@@ -329,7 +329,9 @@ cmd_list() {
       local alive=no driver=no
       kill -0 "$PID" 2>/dev/null && alive=yes
       [[ -n "${DRIVER_PID:-}" ]] && kill -0 "$DRIVER_PID" 2>/dev/null && driver=yes
-      printf '%-6s %-18s %-8s %-6s %-7s %s\n' "$PORT" "$NAME" "$PID" "$alive" "$driver" "$PROFILE" ) || true
+      printf '%-6s %-18s %-8s %-6s %-7s %s\n' "$PORT" "$NAME" "$PID" "$alive" "$driver" "$PROFILE"
+      [[ "$alive" == "yes" && "$driver" == "yes" ]] \
+        && printf '         → drive: chad-browser eval --name %s ...\n' "$NAME" ) || true
   done
   [[ $any -eq 0 ]] && echo "(none)"
   return 0
@@ -396,16 +398,17 @@ resolve_socket() {
 # Send one JSON request over the Unix socket, read one newline-delimited response.
 # Usage: chad-browser eval [--id <name|port>] [--page] [--stdin|--file <f>|'<js>']
 cmd_eval() {
-  local id="" code="" timeout="" page=0 from_stdin=0
+  local id="" code="" timeout="" page=0 from_stdin=0 wait=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id|--name|-n) id=$2; shift 2;;
       --timeout|-t) timeout=$2; shift 2;;
       --page) page=1; shift;;
       --stdin) from_stdin=1; shift;;
+      --wait) wait=$2; shift 2;;
       --help|-h)
         cat <<'HELP'
-chad-browser eval [--id <name|port|pid>] [--timeout <ms>] [--page]
+chad-browser eval [--id <name|port|pid>] [--timeout <ms>] [--page] [--wait '<check>']
                   [--stdin | --file <path> | '<js>']
 
 Runs JS connected to the page. The body is wrapped in an async function — use
@@ -421,6 +424,12 @@ Contexts:
   --page           run in the PAGE context. `document.querySelector(...)` works directly.
                    The body is auto-wrapped in evalInPage(() => { ... }) with IIFE detection.
                    Combine with --stdin/--file for multi-statement page scripts.
+  --wait '<check>' poll a page JS expression until truthy, THEN run the body. Composes
+                   with --page: the wait runs in the driver, the body runs in the page.
+                   Kills the most-repeated boilerplate:
+                     await waitForDomStable(...); return await evalInPage(...)
+                   → instead:
+                     eval --page --wait 'document.querySelector("table tr")' --stdin
 
 In scope (default Node context — no imports needed):
   session.<Domain>.<Method>(params)   full raw CDP surface
@@ -436,6 +445,7 @@ In scope (default Node context — no imports needed):
   use(targetId)                       switch the active page target (iframes/tabs)
 
 In --page context the helpers are NOT in scope — only `document`, `window`, etc.
+(Use --wait to hydrate first, then read in page context.)
 
 Options:
   --timeout <ms>   eval body timeout in ms (default 120000; capped at 600000)
@@ -452,32 +462,39 @@ HELP
   if [[ $from_stdin -eq 1 ]]; then
     code=$(cat)
   fi
-  [[ -n "$code" ]] || die "usage: chad-browser eval [--id <name|port|pid>] [--page] [--timeout <ms>] (--stdin | --file <path> | '<js>')"
+  [[ -n "$code" ]] || die "usage: chad-browser eval [--id <name|port|pid>] [--page] [--wait '<check>'] [--timeout <ms>] (--stdin | --file <path> | '<js>')"
   local sock; sock=$(resolve_socket "$id") || exit 1
   local timeout_json=""
   if [[ -n "$timeout" ]]; then
     [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a number of ms"
     timeout_json=", \"timeout\": $timeout"
   fi
-  python3 - "$sock" "$code" "$timeout_json" "$page" <<'PY'
+  python3 - "$sock" "$code" "$timeout_json" "$page" "$wait" <<'PY'
 import socket, json, sys
-sock_path, code, timeout_json, page_flag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+sock_path, code, timeout_json, page_flag, wait_expr = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5]
+
+def js_str_dq(s):
+    """Escape a JS string literal body for double-quoted strings."""
+    return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
 
 if page_flag:
-    # Auto-IIFE: if the body isn't already a single expression we can pass
-    # verbatim to evalInPage, wrap it so `return` and multi-statement bodies work.
-    # evalInPage takes a single expression string; we detect "needs wrapping" by
-    # checking the body isn't already an IIFE / arrow / bare expression with no
-    # statement terminators. Simplest robust rule: if it contains ';' or 'return'
-    # or starts with '{', wrap in an IIFE.
+    # --page: wrap ONLY the body in evalInPage. The wait call (if any) stays in
+    # Node context where waitForReady is a native helper. This is the key fix:
+    # previously the whole body (including the wait) was wrapped, so waitForReady
+    # wasn't in scope inside evalInPage.
     stripped = code.strip()
-    needs_iife = (';' in stripped) or stripped.startswith('return') or stripped.startswith('{')
-    if needs_iife:
-        inner = code.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
-        code = f'return evalInPage("(async () => {{ {inner} }})()")'
+    needs_iife = (';' in stripped) or stripped.startswith('return') or stripped.startswith('{') or stripped.startswith('await')
+    inner = js_str_dq(code)
+    body = f'return evalInPage("(async () => {{ {inner} }})()")' if needs_iife else f'return evalInPage("{inner}")'
+    if wait_expr:
+        wait_inner = js_str_dq(wait_expr)
+        code = f'await waitForReady({{ check: "{wait_inner}", timeout: 15000, hint: "--wait check" }});\n{body}'
     else:
-        inner = code.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
-        code = f'return evalInPage("{inner}")'
+        code = body
+elif wait_expr:
+    # --wait without --page: prepend the wait call to the body (both in Node context).
+    wait_inner = js_str_dq(wait_expr)
+    code = f'await waitForReady({{ check: "{wait_inner}", timeout: 15000, hint: "--wait check" }});\n' + code
 
 # Default client socket timeout 120s; if the caller set a body timeout, match it
 # (plus a 10s grace so the driver's own timeout error arrives before the socket's).
@@ -513,23 +530,25 @@ PY
 # alias over `eval --file` for backward compat — agents that learned the script
 # pattern keep working.
 cmd_script() {
-  local id="" file="" timeout=""
+  local id="" file="" timeout="" page="" wait=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id|--name|-n) id=$2; shift 2;;
       --timeout|-t) timeout=$2; shift 2;;
+      --page) page=1; shift;;
+      --wait) wait=$2; shift 2;;
       *)       file=$1; shift;;
     esac
   done
-  [[ -n "$file" ]] || die "usage: chad-browser script [--id <name|port|pid>] [--timeout <ms>] <file.js>"
-  # Accept regular files and FIFOs (covers process substitution like <(echo ...)).
+  [[ -n "$file" ]] || die "usage: chad-browser script [--id <name|port|pid>] [--timeout <ms>] [--page] [--wait '<check>'] <file.js>"
   [[ -f "$file" || -p "$file" ]] || die "no such file: $file"
   local code; code=$(<"$file")
-  if [[ -n "$timeout" ]]; then
-    cmd_eval --id "$id" --timeout "$timeout" "$code"
-  else
-    cmd_eval --id "$id" "$code"
-  fi
+  local fwd=()
+  [[ -n "$id" ]] && fwd+=(--id "$id")
+  [[ -n "$timeout" ]] && fwd+=(--timeout "$timeout")
+  [[ -n "$page" ]] && fwd+=(--page)
+  [[ -n "$wait" ]] && fwd+=(--wait "$wait")
+  cmd_eval "${fwd[@]}" "$code"
 }
 
 # Interactive REPL — line-buffered stdin → eval, one response per line.
@@ -613,6 +632,44 @@ cmd_gc() {
   done
 }
 
+cmd_probe() {
+  # Probe one or more URLs for a live HTTP server. Expands a {PORT..PORT2} range
+  # or a comma list in the host portion. Prints the first URL that responds, with
+  # status code. Helps agents stop guessing which localhost port the dev server
+  # is on — a top source of wasted turns in multi-instance workflows.
+  local url=${1:-} code
+  [[ -n "$url" ]] || die "usage: chad-browser probe <url>  (url may contain {8080..8090} or {8080,8081})"
+  # Expand a single {start..end} or {a,b,c} brace in the URL.
+  local urls=()
+  if [[ "$url" =~ \{([0-9]+)\.\.([0-9]+)\} ]]; then
+    local lo=${BASH_REMATCH[1]} hi=${BASH_REMATCH[2]} p
+    for ((p=lo; p<=hi; p++)); do urls+=("${url/\{*$lo..\$hi\}/$p}"); done
+    # The above substitution is fragile; do it the robust way:
+    urls=()
+    local prefix="${url%%\{*}" suffix="${url#*\}}"
+    suffix="${suffix#*\}}"
+    for ((p=lo; p<=hi; p++)); do urls+=("${prefix}${p}${suffix}"); done
+  elif [[ "$url" =~ \{([^}]*)\} ]]; then
+    local brace=${BASH_REMATCH[1]}
+    local prefix="${url%%\{*}" suffix="${url#*\}}"
+    suffix="${suffix#*\}}"
+    IFS=',' read -ra parts <<<"$brace"
+    for p in "${parts[@]}"; do urls+=("${prefix}${p}${suffix}"); done
+  else
+    urls+=("$url")
+  fi
+  local u
+  for u in "${urls[@]}"; do
+    code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "$u" 2>/dev/null) || code="down"
+    if [[ "$code" != "000" && "$code" != "down" ]]; then
+      printf '%s  %s\n' "$code" "$u"
+      return 0
+    fi
+  done
+  echo "no live server found among ${#urls[@]} URL(s)" >&2
+  return 1
+}
+
 cmd_info() {
   echo "BIN       $BIN -> $(command -v "$BIN" 2>/dev/null || echo MISSING)"
   echo "BASE      $BASE"
@@ -639,6 +696,7 @@ case "${1:-}" in
   script)          shift; cmd_script "$@";;
   repl)            shift; cmd_repl "$@";;
   gc)              shift; cmd_gc "$@";;
+  probe)           shift; cmd_probe "$@";;
   info)            cmd_info;;
   ""|-h|--help)    usage;;
   *) die "unknown command '$1' (try: chad-browser --help)";;
