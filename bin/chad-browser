@@ -13,13 +13,24 @@
 #   chad-browser up [opts] [URLs...] [-- chromium-flag...]
 #                                       launch an isolated, pre-authenticated browser
 #   chad-browser down <port|name|pid>   stop it + remove its ephemeral profile
-#   chad-browser list                   running agent browsers
+#   chad-browser list                   running agent browsers (with drive hints)
 #   chad-browser cdp  <port|name|pid>   print the browser websocket endpoint
-#   chad-browser eval [--id <id>] '<js>'  run JS against the page via the driver
-#   chad-browser script [--id <id>] <f>   run a JS file against the page
-#   chad-browser repl [--id <id>]         interactive JS prompt
+#   chad-browser eval [--id|--name <id>] [--page] [--wait '<check>']
+#                     [--stdin|--file <f>|'<js>']   run JS against the page
+#   chad-browser script [--id|--name <id>] [--page] [--wait '<check>'] <f>
+#                                       run a JS file against the page
+#   chad-browser repl [--id|--name <id>]          interactive JS prompt
+#   chad-browser probe <url>            find a live server (supports {8080..8090} ranges)
 #   chad-browser gc                     reap profiles whose process is gone
 #   chad-browser info                   resolved base/binary/port-range/driver
+#
+# eval flags:
+#   --id|--name <id>  target instance (alias; either works)
+#   --page            run JS in the page context (document.querySelector works directly)
+#   --wait '<check>'  poll a page JS expr until truthy, then run the body (composes with --page)
+#   --stdin           read JS from stdin (pipe a heredoc — avoids shell-quoting hell)
+#   --file <path>     read JS from a file
+#   --timeout <ms>    eval body timeout (default 120000, capped 600000)
 #
 # up opts:
 #   --name NAME      label (default: chad-<port>)
@@ -189,6 +200,13 @@ cmd_up() {
   # that gets `rm -rf`d on down. Reject anything that isn't a safe label.
   [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
     || die "invalid --name '$name': use letters, digits, ., _, - (max 64 chars), starting alphanumeric"
+  # Reject a name already in use by a live instance. Two instances sharing a name
+  # would share a socket path — the second silently hijacks the name and orphans
+  # the first (its eval calls would route to the wrong browser). `list` to see them.
+  local existing
+  if existing=$(resolve_id "$name" 2>/dev/null); then
+    die "name '$name' is already in use by a live instance (run: chad-browser list, then chad-browser down $name)"
+  fi
 
   # Reserve the port atomically before any slow work (profile copy, Chromium
   # launch) so concurrent `up` calls don't double-allocate. The placeholder is
@@ -291,7 +309,7 @@ PY
     [[ -n "$sock" ]] && echo "SOCKET=$sock"
     echo
     if [[ -n "$sock" ]]; then
-      echo "→ driver on $sock  (drive: chad-browser eval '<js>')"
+      echo "→ driver on $sock  (drive: chad-browser eval --name $name '<js>')"
     else
       echo "→ CDP live at http://127.0.0.1:$port  (driver not installed; raw CDP only)"
     fi
@@ -330,7 +348,10 @@ cmd_list() {
       kill -0 "$PID" 2>/dev/null && alive=yes
       [[ -n "${DRIVER_PID:-}" ]] && kill -0 "$DRIVER_PID" 2>/dev/null && driver=yes
       printf '%-6s %-18s %-8s %-6s %-7s %s\n' "$PORT" "$NAME" "$PID" "$alive" "$driver" "$PROFILE"
-      [[ "$alive" == "yes" && "$driver" == "yes" ]] \
+      # Only show drive hints for chad-browser-spawned instances (PROFILE under EPHEM_ROOT).
+      # Externally-attached browsers (e.g. the daily-driver 9222 "attach") have an empty
+      # PROFILE — never invite an agent to drive them; that's a safety footgun.
+      [[ "$alive" == "yes" && "$driver" == "yes" && -n "$PROFILE" && "$PROFILE" == "$EPHEM_ROOT"/* ]] \
         && printf '         → drive: chad-browser eval --name %s ...\n' "$NAME" ) || true
   done
   [[ $any -eq 0 ]] && echo "(none)"
@@ -372,9 +393,14 @@ resolve_mine() {
     done
   done
   if [[ ${#matches[@]} -eq 1 ]]; then echo "${matches[0]}"; return 0; fi
-  # no ancestor match — fall back to "only one running" heuristic
+  # no ancestor match — fall back to "only one SPAWNED instance" heuristic.
+  # Skip externally-attached browsers (empty PROFILE) — never auto-drive those.
   local all=()
-  for f in "$RUNDIR"/*.env; do [[ -e "$f" ]] && all+=("$f"); done
+  for f in "$RUNDIR"/*.env; do
+    [[ -e "$f" ]] || continue
+    local prof; prof=$(grep -E '^PROFILE=' "$f" | cut -d= -f2-)
+    [[ -n "$prof" && "$prof" == "$EPHEM_ROOT"/* ]] && all+=("$f")
+  done
   if [[ ${#all[@]} -eq 1 ]]; then echo "${all[0]}"; return 0; fi
   if [[ ${#all[@]} -eq 0 ]]; then echo "no running chad-browser instances" >&2; return 1; fi
   echo "multiple chad-browser instances running; name one explicitly:" >&2
@@ -391,6 +417,13 @@ resolve_socket() {
   else f=$(resolve_id "$id") || die "no agent browser matching '$id'"; fi
   # shellcheck disable=SC1090
   source "$f"
+  # Safety guard: never let an agent drive an externally-attached browser (e.g. the
+  # daily-driver 9222 "attach"). These have an empty PROFILE (not spawned by us).
+  # Driving them executes JS in Ahmed's real browser — reading real sessions,
+  # triggering real actions. That violates the tool's isolation premise.
+  if [[ -z "${PROFILE:-}" || "$PROFILE" != "$EPHEM_ROOT"/* ]]; then
+    die "refusing to drive '$NAME': it is an externally-attached browser (not a chad-browser-spawned instance). Use a spawned instance instead."
+  fi
   [[ -n "${SOCKET:-}" && -S "$SOCKET" ]] || die "no driver socket for $NAME (driver not installed? raw CDP at http://127.0.0.1:$PORT)"
   echo "$SOCKET"
 }
@@ -398,14 +431,15 @@ resolve_socket() {
 # Send one JSON request over the Unix socket, read one newline-delimited response.
 # Usage: chad-browser eval [--id <name|port>] [--page] [--stdin|--file <f>|'<js>']
 cmd_eval() {
-  local id="" code="" timeout="" page=0 from_stdin=0 wait=""
+  local id="" code="" timeout="" page=0 from_stdin=0 wait="" wait_set=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id|--name|-n) id=$2; shift 2;;
       --timeout|-t) timeout=$2; shift 2;;
       --page) page=1; shift;;
       --stdin) from_stdin=1; shift;;
-      --wait) wait=$2; shift 2;;
+      --file) from_stdin=0; code=$(<"$2"); shift 2;;
+      --wait) wait=$2; wait_set=1; shift 2;;
       --help|-h)
         cat <<'HELP'
 chad-browser eval [--id <name|port|pid>] [--timeout <ms>] [--page] [--wait '<check>']
@@ -463,6 +497,12 @@ HELP
     code=$(cat)
   fi
   [[ -n "$code" ]] || die "usage: chad-browser eval [--id <name|port|pid>] [--page] [--wait '<check>'] [--timeout <ms>] (--stdin | --file <path> | '<js>')"
+  # --wait with an empty/whitespace-only check would silently skip the wait (the
+  # flag path bypasses waitForReady's own validation). Reject it explicitly so a
+  # shell-quoting bug (--wait "$MAYBE_EMPTY") surfaces as an error, not a wrong answer.
+  if [[ $wait_set -eq 1 ]] && [[ ! "$wait" =~ [^[:space:]] ]]; then
+    die "--wait needs a non-empty JS check expression (got whitespace only)"
+  fi
   local sock; sock=$(resolve_socket "$id") || exit 1
   local timeout_json=""
   if [[ -n "$timeout" ]]; then
@@ -526,9 +566,9 @@ sys.stdout.write(buf.decode() if buf else '{"error":"no response from driver"}\n
 PY
 }
 
-# Like eval but reads the JS from a file (multi-line scripts). Kept as a thin
-# alias over `eval --file` for backward compat — agents that learned the script
-# pattern keep working.
+# Like eval but reads the JS from a file (multi-line scripts). Forwards all
+# eval flags (--page, --wait, --timeout, --id/--name) so the file's JS runs in
+# the same context you'd get from an inline eval with those flags.
 cmd_script() {
   local id="" file="" timeout="" page="" wait=""
   while [[ $# -gt 0 ]]; do
@@ -565,7 +605,11 @@ cmd_repl() {
       .exit|.quit|.q|exit|quit) echo; return 0;;
     esac
     [[ -z "$line" ]] && continue
-    cmd_eval "$id" "$line"
+    if [[ -n "$id" ]]; then
+      cmd_eval --id "$id" "$line"
+    else
+      cmd_eval "$line"
+    fi
   done
   echo
 }
