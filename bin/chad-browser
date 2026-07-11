@@ -54,6 +54,7 @@ BASE="${CHAD_BROWSER_BASE:-$HOME/.config/chromium}"
 BIN="${CHAD_BROWSER_BIN:-chromium}"
 CACHEDIR="${XDG_CACHE_HOME:-$HOME/.cache}/chad-browser"
 RUNDIR="$CACHEDIR/run"
+MEMORY_DIR="$CACHEDIR/memory"
 EPHEM_ROOT="${TMPDIR:-/tmp}/chad-browser"
 SOCKDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/chad-browser"
 # driver.mjs lives next to this script at <prefix>/lib/driver.mjs (consolidated
@@ -74,7 +75,7 @@ CB_PORT_MAX="${CB_PORT_MAX:-9499}"
 
 die() { echo "chad-browser: $*" >&2; exit 1; }
 
-ensure_dirs() { mkdir -p "$CACHEDIR" "$RUNDIR" "$EPHEM_ROOT" "$SOCKDIR"; }
+ensure_dirs() { mkdir -p "$CACHEDIR" "$RUNDIR" "$MEMORY_DIR" "$EPHEM_ROOT" "$SOCKDIR"; }
 
 # Copy the base profile into an ephemeral dir. The auth SQLite DBs are snapshotted with
 # `sqlite3 .backup` so a live base (rows still in *-wal) is captured consistently; their
@@ -166,13 +167,14 @@ resolve_id() {  # echo runfile path for port|name|pid
 }
 
 cmd_up() {
-  local name="" port="" store="" json=0 urls=() raw=()
+  local name="" port="" store="" app="" json=0 urls=() raw=()
   local headless=${CB_HEADLESS:-0}
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name)  name=$2; shift 2;;
       --port)  port=$2; shift 2;;
       --store) store=$2; shift 2;;
+      --app)   app=$2; shift 2;;
       --headless) headless=1; shift;;
       --headed)   headless=0; shift;;
       --json)  json=1; shift;;
@@ -200,6 +202,12 @@ cmd_up() {
   # that gets `rm -rf`d on down. Reject anything that isn't a safe label.
   [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
     || die "invalid --name '$name': use letters, digits, ., _, - (max 64 chars), starting alphanumeric"
+  # --app tags the instance for the memory hook (chad-browser remember/recall).
+  # Same charset as --name (it's used as a filename under ~/.cache/chad-browser/memory).
+  if [[ -n "$app" ]]; then
+    [[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+      || die "invalid --app '$app': use letters, digits, ., _, - (max 64 chars), starting alphanumeric"
+  fi
   # Reject a name already in use by a live instance. Two instances sharing a name
   # would share a socket path — the second silently hijacks the name and orphans
   # the first (its eval calls would route to the wrong browser). `list` to see them.
@@ -222,6 +230,7 @@ WS=
 SHELL_PID=$PPID
 DRIVER_PID=
 SOCKET=
+APP=$app
 RESERVED=1
 EOF
 
@@ -287,6 +296,7 @@ WS=$ws
 SHELL_PID=$PPID
 DRIVER_PID=$driver_pid
 SOCKET=$sock
+APP=$app
 EOF
   # The real runfile is committed; the atomic reserve dir is now redundant.
   rmdir "$RUNDIR/.reserve-$port" 2>/dev/null || true
@@ -339,7 +349,7 @@ cmd_down() {
 cmd_list() {
   ensure_dirs
   local f any=0
-  printf '%-6s %-18s %-8s %-6s %-7s %s\n' PORT NAME PID ALIVE DRIVER PROFILE
+  printf '%-6s %-18s %-8s %-6s %-7s %-12s %s\n' PORT NAME PID ALIVE DRIVER APP PROFILE
   for f in "$RUNDIR"/*.env; do
     [[ -e "$f" ]] || continue; any=1
     # shellcheck disable=SC1090
@@ -347,7 +357,7 @@ cmd_list() {
       local alive=no driver=no
       kill -0 "$PID" 2>/dev/null && alive=yes
       [[ -n "${DRIVER_PID:-}" ]] && kill -0 "$DRIVER_PID" 2>/dev/null && driver=yes
-      printf '%-6s %-18s %-8s %-6s %-7s %s\n' "$PORT" "$NAME" "$PID" "$alive" "$driver" "$PROFILE"
+      printf '%-6s %-18s %-8s %-6s %-7s %-12s %s\n' "$PORT" "$NAME" "$PID" "$alive" "$driver" "${APP:-}" "$PROFILE"
       # Only show drive hints for chad-browser-spawned instances (PROFILE under EPHEM_ROOT).
       # Externally-attached browsers (e.g. the daily-driver 9222 "attach") have an empty
       # PROFILE — never invite an agent to drive them; that's a safety footgun.
@@ -426,6 +436,17 @@ resolve_socket() {
   fi
   [[ -n "${SOCKET:-}" && -S "$SOCKET" ]] || die "no driver socket for $NAME (driver not installed? raw CDP at http://127.0.0.1:$PORT)"
   echo "$SOCKET"
+}
+
+# Resolve the runfile path for an instance id (or "mine" if empty). Used by the
+# memory hook to read APP= without re-sourcing the whole file.
+resolve_runfile_for() {
+  local id=${1:-}
+  if [[ -z "$id" ]]; then
+    resolve_mine 2>/dev/null || return 1
+  else
+    resolve_id "$id" 2>/dev/null || return 1
+  fi
 }
 
 # Send one JSON request over the Unix socket, read one newline-delimited response.
@@ -509,7 +530,27 @@ HELP
     [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a number of ms"
     timeout_json=", \"timeout\": $timeout"
   fi
-  python3 - "$sock" "$code" "$timeout_json" "$page" "$wait" <<'PY'
+  # Resolve the app key for the memory hook. If this instance was started with
+  # --app, read the memory file and pass it in the payload so the driver can
+  # expose it as `memory` in the eval context. Empty/no file → empty array.
+  local mem_json=""
+  local runfile
+  if runfile=$(resolve_runfile_for "$id" 2>/dev/null); then
+    local app
+    app=$(grep -E '^APP=' "$runfile" 2>/dev/null | cut -d= -f2-)
+    if [[ -n "$app" ]]; then
+      local memfile="$MEMORY_DIR/$app.json"
+      if [[ -f "$memfile" ]]; then
+        # Compact to a single-line JSON array (the file is pretty-printed for
+        # human readability; embedding multi-line JSON breaks the payload parse).
+        # Validate first; skip silently if corrupt rather than crashing the eval.
+        local compact
+        compact=$(python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))" "$memfile" 2>/dev/null) \
+          && mem_json=", \"memory\": $compact"
+      fi
+    fi
+  fi
+  python3 - "$sock" "$code" "$timeout_json$mem_json" "$page" "$wait" <<'PY'
 import socket, json, sys
 sock_path, code, timeout_json, page_flag, wait_expr = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5]
 
@@ -714,6 +755,113 @@ cmd_probe() {
   return 1
 }
 
+# --- memory hook -------------------------------------------------------------
+# Memory lets agents that visit the same app share hard-won knowledge: which
+# selectors work, where the dev server lives, how to wait for hydration, etc.
+# Keyed by --app (set on `up`) so multiple dev-server ports collapse to one key.
+# Falls back to hostname for prod sites when --app wasn't passed.
+# Storage: $MEMORY_DIR/<key>.json — a flat array of strings.
+
+memory_key_for_instance() {
+  local runfile id_port id_name app
+  runfile=$(resolve_mine 2>/dev/null || resolve_id "${1:-}" 2>/dev/null) || return 1
+  [[ -n "$runfile" && -e "$runfile" ]] || return 1
+  app=$(grep -E '^APP=' "$runfile" | cut -d= -f2-)
+  if [[ -n "$app" ]]; then
+    echo "$app"
+    return 0
+  fi
+  # Fallback: derive a key from the hostname of the first URL the instance opened.
+  # For prod sites (app.example.com) this gives a stable key across port-less URLs.
+  echo "chad-browser: no --app set for this instance. Pass --app <name> on 'up', or use --app <name> on 'recall'/'remember'." >&2
+  return 1
+}
+
+cmd_remember() {
+  local app="" fact="" json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --app)  app=$2; shift 2;;
+      --json) json=1; shift;;
+      -*)     die "unknown option '$1' (see: chad-browser remember --help)";;
+      *)      fact="${fact:+$fact }$1"; shift;;
+    esac
+  done
+  [[ -n "$fact" ]] || die "usage: chad-browser remember [--app <name>] \"<fact>\""
+  # Resolve the app key: explicit --app flag wins; otherwise read it from the
+  # current shell's instance runfile.
+  if [[ -z "$app" ]]; then
+    app=$(memory_key_for_instance) || die "no --app set and no instance found for this shell (pass --app <name> explicitly)"
+  fi
+  [[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+    || die "invalid app key '$app': use letters, digits, ., _, - (max 64 chars)"
+  mkdir -p "$MEMORY_DIR"
+  local file="$MEMORY_DIR/$app.json"
+  local arr
+  if [[ -f "$file" ]]; then
+    arr=$(cat "$file")
+  else
+    arr='[]'
+  fi
+  # Append + dedupe (case-sensitive). Keep newest-first so recall reads fresh.
+  local new
+  new=$(printf '%s' "$arr" | python3 -c "
+import json, sys
+arr = json.load(sys.stdin)
+fact = sys.argv[1]
+if fact in arr:
+    arr.remove(fact)
+arr.insert(0, fact)
+# Keep the list bounded — old facts that haven't been re-confirmed age out.
+arr = arr[:50]
+print(json.dumps(arr, indent=2))
+" "$fact")
+  printf '%s\n' "$new" > "$file"
+  if [[ $json -eq 1 ]]; then
+    printf '%s\n' "$new"
+  else
+    echo "remembered for '$app': $fact"
+  fi
+}
+
+cmd_recall() {
+  local app="" json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --app)  app=$2; shift 2;;
+      --json) json=1; shift;;
+      -*)     die "unknown option '$1' (see: chad-browser recall --help)";;
+      *)      die "unexpected argument '$1' (usage: chad-browser recall [--app <name>] [--json])";;
+    esac
+  done
+  if [[ -z "$app" ]]; then
+    app=$(memory_key_for_instance 2>/dev/null) || {
+      if [[ $json -eq 1 ]]; then echo '[]'; else echo "(no memories: no --app set on this instance, and no --app flag given)"; fi
+      return 0
+    }
+  fi
+  [[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+    || die "invalid app key '$app': use letters, digits, ., _, - (max 64 chars)"
+  local file="$MEMORY_DIR/$app.json"
+  if [[ ! -f "$file" ]]; then
+    if [[ $json -eq 1 ]]; then echo '[]'; else echo "(no memories yet for '$app')"; fi
+    return 0
+  fi
+  if [[ $json -eq 1 ]]; then
+    cat "$file"
+  else
+    echo "memories for '$app':"
+    cat "$file" | python3 -c "
+import json, sys
+arr = json.load(sys.stdin)
+for i, fact in enumerate(arr, 1):
+    print(f'  {i}. {fact}')
+if not arr:
+    print('  (none)')
+"
+  fi
+}
+
 cmd_info() {
   echo "BIN       $BIN -> $(command -v "$BIN" 2>/dev/null || echo MISSING)"
   echo "BASE      $BASE"
@@ -741,6 +889,8 @@ case "${1:-}" in
   repl)            shift; cmd_repl "$@";;
   gc)              shift; cmd_gc "$@";;
   probe)           shift; cmd_probe "$@";;
+  remember)        shift; cmd_remember "$@";;
+  recall)          shift; cmd_recall "$@";;
   info)            cmd_info;;
   ""|-h|--help)    usage;;
   *) die "unknown command '$1' (try: chad-browser --help)";;

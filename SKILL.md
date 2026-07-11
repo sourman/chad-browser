@@ -154,6 +154,12 @@ The Node context exposes the full CDP surface plus these helpers:
   traffic-interception experiments so the loader doesn't stay wedged.
 - **`onEvent(method, fn)` / `captureRequests(urlPattern, fn, opts?)`** — subscribe to
   CDP events, or ergonomically capture matching network requests + bodies.
+- **`snapshotInteractive({ max? })`** — return `{ url, title, count, elements }` for
+  all visible interactive elements on the page (links, buttons, inputs, `[role]`).
+  Use instead of dumping `outerHTML` — you get the signal without the noise.
+- **`memory`** — an array of strings auto-injected from the instance's `--app` memory
+  file (facts saved by `chad-browser remember`). Empty if `up` was called without
+  `--app`. Lets agents that visit the same app skip discovery costs.
 
 Full recipes (navigate, click, forms, downloads, iframes, screenshots) and the
 complete helper reference are in **`references/driving.md`**. Every `eval` call
@@ -178,6 +184,32 @@ return automatically).
    changes no longer detach the target — the driver re-attaches on
    `Page.frameNavigated` and retries calls that land mid-navigation. Still follow a
    navigation with `waitForReady`.
+9. **DOM nodes auto-describe in returns.** Returning `document.querySelector('h1')`
+   from `evalInPage` or `--page` mode yields a descriptive string like
+   `"<h1 class=\"title\">Welcome</h1>"` — not `{}` (the silent empty CDP gives by
+   default). Use this to probe elements without extracting `.textContent` by hand.
+
+## Sharing knowledge across agents: the memory hook
+
+When multiple agents test the same app (e.g. several agents on different dev-server
+ports), tag each instance with `--app` so they can share learned facts:
+
+```bash
+chad-browser up --name agent1 --app cora-dev --headless http://localhost:8080
+chad-browser remember --app cora-dev "table hydration check: document.querySelectorAll('table tbody tr').length > 0"
+chad-browser remember --app cora-dev "login selector: form[action='/login'] input[name='email']"
+
+# A second agent on the same app inherits these:
+chad-browser up --name agent2 --app cora-dev --headless http://localhost:8081
+chad-browser eval --name agent2 --stdin <<'JS'
+// `memory` is auto-injected — apply the known hydration check from agent1
+const check = memory.find(m => m.includes('hydration check'));
+return { memories: memory.length, first: memory[0] };
+JS
+```
+
+Memory files live at `~/.cache/chad-browser/memory/<app>.json`, newest-first,
+bounded to 50 entries. Use `chad-browser recall --app <name>` to inspect them.
 
 ## Before you go further
 

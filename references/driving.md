@@ -28,6 +28,8 @@ the inline positional `<js>` arg — use `--stdin` for anything with nested quot
 | `use(targetId)` | Switch the active target via `Target.attachToTarget`. For cross-origin iframes and multi-tab flows. |
 | `onEvent(method, fn)` | Subscribe to a CDP event. Returns an unsubscribe function. See [Network events](#network-events--capturing-requests). |
 | `captureRequests(urlPattern, fn, opts?)` | Run `fn` while collecting network requests whose URL matches `urlPattern` (substring or RegExp). Returns `{ requests, count }`. See [Network events](#network-events--capturing-requests). |
+| `snapshotInteractive({ max? })` | Return `{ url, title, count, elements }` for all visible interactive elements on the page (links, buttons, inputs, selects, `[role]`, `[tabindex]`). Each element is a compact object (`{ tag, id?, classes?, role?, text?, href?, type?, placeholder? }`). Use this instead of dumping `outerHTML` — you get the signal without the noise. |
+| `memory` | Array of strings — facts previously saved with `chad-browser remember`. Auto-injected from the instance's `--app` memory file. Empty if no `--app` was set on `up`. |
 
 `session` auto-routes to the active page target (set during `up`). Browser-level
 methods (`Browser.*`, `Target.*`) go to the browser endpoint. No domain is denied
@@ -118,6 +120,39 @@ return await evalInPage(`
     return rows.map(r => r.textContent.trim());
   })()
 `);
+```
+
+### DOM nodes auto-describe
+
+`evalInPage` (and therefore `--page` mode) automatically describes DOM nodes in the
+return value. Returning `document.querySelector('h1')` yields a descriptive string
+like `"<h1 class=\"title\">Welcome</h1>"` instead of `{}` (the silent empty you'd
+get from raw CDP `returnByValue`). This works recursively through arrays and
+objects too:
+
+```js
+// In Node context:
+return await evalInPage(() => document.querySelectorAll('a'));
+
+// → [
+//   '<a href="/login" text="Sign in">',
+//   '<a href="/signup" text="Sign up">',
+//   '<a class="nav.logo" href="/" text="Home">'
+// ]
+```
+
+### Snapshot interactive elements
+
+When you don't know the page structure, prefer `snapshotInteractive()` over dumping
+`outerHTML` — you get a clean list of every actionable element without megabytes of
+div noise:
+
+```js
+const snap = await snapshotInteractive();
+// snap.elements[0] → { tag: 'a', text: 'Sign in', href: '/login' }
+// snap.elements[1] → { tag: 'input', type: 'email', placeholder: 'you@x.com', name: 'email' }
+// snap.elements[2] → { tag: 'button', text: 'Continue', classes: ['btn', 'btn-primary'] }
+return snap;
 ```
 
 ## Click
@@ -397,6 +432,58 @@ return { title, links };
 EOF
 chad-browser script --name myagent /tmp/flow.js
 ```
+
+## Memory (sharing facts across agents)
+
+When multiple agents visit the same app (e.g. several agents testing different
+routes of a dev server), they can share hard-won knowledge: which selectors work,
+where the server lives, how to wait for hydration, etc. This is the **memory hook**.
+
+**Tag the instance with `--app` on `up`:**
+
+```bash
+chad-browser up --name agent1 --app cora-dev --headless http://localhost:8080
+```
+
+**Save a fact:**
+
+```bash
+chad-browser remember --app cora-dev "dev server lives on port 8080, probe {8080..8090} first"
+chad-browser remember --app cora-dev "login form selector: form[action='/login'] input[name='email']"
+chad-browser remember --app cora-dev "table is hydrated when: document.querySelectorAll('table tbody tr').length > 0"
+```
+
+**Recall facts:**
+
+```bash
+chad-browser recall --app cora-dev
+# memories for 'cora-dev':
+#   1. table is hydrated when: document.querySelectorAll('table tbody tr').length > 0
+#   2. login form selector: form[action='/login'] input[name='email']
+#   3. dev server lives on port 8080, probe {8080..8090} first
+```
+
+**Auto-injected in eval:** if the instance was started with `--app`, the `memory`
+array is auto-injected into every `eval` context. You can read it directly:
+
+```bash
+chad-browser eval --name agent1 --stdin <<'JS'
+if (memory.length) {
+  console.log('inherited memories:', memory);
+  // e.g. apply a known-good hydration check from a prior agent
+}
+return await snapshotInteractive();
+JS
+```
+
+**Workflow:** the first agent on a new app pays the discovery cost. It records what
+it learned. Subsequent agents start with those facts and skip the discovery phase.
+`recall` is newest-first; re-recording a fact bumps it to the top. The list is
+bounded to 50 facts so stale ones age out.
+
+**No `--app` set?** `remember` and `recall` without `--app` resolve the key from the
+current shell's instance. If neither is available, both commands fail with a clear
+message. `memory` in eval context is just an empty array when no app is set.
 
 ## Error handling
 

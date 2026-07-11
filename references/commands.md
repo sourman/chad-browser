@@ -16,6 +16,8 @@ Full reference for every `chad-browser` command, flag, and env var. Verified aga
 | `repl [--id\|--name <id>]` | Interactive JS prompt (line-buffered). |
 | `gc` | Reap profiles/sockets whose process is gone + remove orphans. |
 | `probe <url>` | Probe a URL (supports `{8080..8090}` ranges / `{8080,8081}` lists) for a live HTTP server. Prints `<code> <url>` on the first responder. Use to find which localhost port the dev server is on. |
+| `remember [--app <name>] "<fact>"` | Save a fact (selector, hint, flow step) to the app's memory file. Auto-dedupes, newest-first, bounded to 50 entries. |
+| `recall [--app <name>] [--json]` | Print all facts for the app (human-readable, or `--json` for the raw array). |
 | `info` | Print resolved BASE / BIN / RUNDIR / SOCKDIR / DRIVER / NODE / port range. |
 | `--help` / `-h` / (no args) | Print the usage block. |
 
@@ -31,6 +33,7 @@ is an ancestor of the current shell.
 |---|---|
 | `--name NAME` | Label for the instance (default `chad-<port>`). |
 | `--port N` | Force a specific port (else first free in `CB_PORT_MIN..CB_PORT_MAX`). |
+| `--app NAME` | Tag the instance with an app key for the memory hook (`remember`/`recall`). Facts saved under this key are auto-injected into `eval` as the `memory` array. Use the same `--app` across agents that test the same app on different ports. |
 | `--headless` | No window. Also via `CB_HEADLESS=1`. |
 | `--headed` | Force a window (overrides `CB_HEADLESS=1`). |
 | `--store STORE` | `--password-store` value. **Default = inherit base — do not pass this** (see `auth-and-cdp.md`). |
@@ -130,6 +133,7 @@ The reply is a single JSON line: `{"value": <result>}` on success, `{"error": ".
 - Ephemeral profiles: `/tmp/chad-browser/<name>-<port>` (deleted on `down`).
 - Driver sockets: `$XDG_RUNTIME_DIR/chad-browser/<name>.sock` (deleted on `down`).
 - Driver logs: `~/.cache/chad-browser/<name>-driver.log` (for debugging launch failures).
+- Memory files: `~/.cache/chad-browser/memory/<app>.json` (one JSON array per app key).
 
 The base browser (the user's daily browser, typically CDP `9222`) and `google-chrome` are
 unrelated and never touched.
