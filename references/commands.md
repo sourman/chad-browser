@@ -16,8 +16,6 @@ Full reference for every `chad-browser` command, flag, and env var. Verified aga
 | `repl [--id\|--name <id>]` | Interactive JS prompt (line-buffered). |
 | `gc` | Reap profiles/sockets whose process is gone + remove orphans. |
 | `probe <url>` | Probe a URL (supports `{8080..8090}` ranges / `{8080,8081}` lists) for a live HTTP server. Prints `<code> <url>` on the first responder. Use to find which localhost port the dev server is on. |
-| `remember [--app <name>] "<fact>"` | Save a fact (selector, hint, flow step) to the app's memory file. Auto-dedupes, newest-first, bounded to 50 entries. |
-| `recall [--app <name>] [--json]` | Print all facts for the app (human-readable, or `--json` for the raw array). |
 | `info` | Print resolved BASE / BIN / RUNDIR / SOCKDIR / DRIVER / NODE / port range. |
 | `--help` / `-h` / (no args) | Print the usage block. |
 
@@ -33,7 +31,7 @@ is an ancestor of the current shell.
 |---|---|
 | `--name NAME` | Label for the instance (default `chad-<port>`). |
 | `--port N` | Force a specific port (else first free in `CB_PORT_MIN..CB_PORT_MAX`). |
-| `--app NAME` | Tag the instance with an app key for the memory hook (`remember`/`recall`). Facts saved under this key are auto-injected into `eval` as the `memory` array. Use the same `--app` across agents that test the same app on different ports. |
+| `--app NAME` | Tag the instance with an app key for the memory hook. The memory file path is shown in `up` output (`MEMORY=...`). Facts from the file are auto-injected into `eval` as the `memory` array. Read/write the file with native file tools. Use the same `--app` across agents that test the same app on different ports. |
 | `--headless` | No window. Also via `CB_HEADLESS=1`. |
 | `--headed` | Force a window (overrides `CB_HEADLESS=1`). |
 | `--store STORE` | `--password-store` value. **Default = inherit base — do not pass this** (see `auth-and-cdp.md`). |
@@ -50,7 +48,7 @@ Baked-in Chromium flags (anti-throttle so agent-driven background tabs don't sta
 (`~/.local/lib/chad-browser/driver.mjs`) which connects to Chromium's WS endpoint,
 auto-enables `Page`/`Runtime`/`DOM`/`Network`, attaches to the first page target,
 and listens on a Unix socket at `$SOCKDIR/<name>.sock`. On success it writes a runfile
-to `~/.cache/chad-browser/run/<port>.env` and prints `PORT= NAME= PID= HTTP= WS= PROFILE= SOCKET=`.
+to `~/.cache/chad-browser/run/<port>.env` and prints `PORT= NAME= PID= HTTP= WS= PROFILE= SOCKET=` (and `MEMORY=` when `--app` is set).
 
 Wall-clock for `up` is typically ~1-7s (profile clone + Chromium start + CDP wait + driver
 attach). Headless launches are near the low end (~1s); the first launch of a session may be

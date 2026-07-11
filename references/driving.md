@@ -29,7 +29,7 @@ the inline positional `<js>` arg — use `--stdin` for anything with nested quot
 | `onEvent(method, fn)` | Subscribe to a CDP event. Returns an unsubscribe function. See [Network events](#network-events--capturing-requests). |
 | `captureRequests(urlPattern, fn, opts?)` | Run `fn` while collecting network requests whose URL matches `urlPattern` (substring or RegExp). Returns `{ requests, count }`. See [Network events](#network-events--capturing-requests). |
 | `snapshotInteractive({ max? })` | Return `{ url, title, count, elements }` for all visible interactive elements on the page (links, buttons, inputs, selects, `[role]`, `[tabindex]`). Each element is a compact object (`{ tag, id?, classes?, role?, text?, href?, type?, placeholder?, value? }`). Use this instead of dumping `outerHTML` — you get the signal without the noise. |
-| `memory` | Array of strings — facts previously saved with `chad-browser remember`. Auto-injected from the instance's `--app` memory file. Empty if no `--app` was set on `up`. |
+| `memory` | Array of strings — facts from the instance's `--app` memory file. Auto-injected from `~/.cache/chad-browser/memory/<app>.json` (a plain JSON array). Read/write the file with native file tools. Empty if no `--app` was set on `up`. |
 
 `session` auto-routes to the active page target (set during `up`). Browser-level
 methods (`Browser.*`, `Target.*`) go to the browser endpoint. No domain is denied
@@ -443,24 +443,28 @@ where the server lives, how to wait for hydration, etc. This is the **memory hoo
 
 ```bash
 chad-browser up --name agent1 --app cora-dev --headless http://localhost:8080
+# Output includes:
+#   MEMORY=~/.cache/chad-browser/memory/cora-dev.json (0 facts)
 ```
 
-**Save a fact:**
+**The file is the source of truth.** It's a plain JSON array of strings. There are
+no `remember`/`recall` commands — read and write the file with native file tools:
 
 ```bash
-chad-browser remember --app cora-dev "dev server lives on port 8080, probe {8080..8090} first"
-chad-browser remember --app cora-dev "login form selector: form[action='/login'] input[name='email']"
-chad-browser remember --app cora-dev "table is hydrated when: document.querySelectorAll('table tbody tr').length > 0"
-```
+# Read all facts for an app:
+# → use Read tool on ~/.cache/chad-browser/memory/cora-dev.json
 
-**Recall facts:**
+# Search across all apps' memories:
+# → use Grep tool on ~/.cache/chad-browser/memory/
 
-```bash
-chad-browser recall --app cora-dev
-# memories for 'cora-dev':
-#   1. table is hydrated when: document.querySelectorAll('table tbody tr').length > 0
-#   2. login form selector: form[action='/login'] input[name='email']
-#   3. dev server lives on port 8080, probe {8080..8090} first
+# Write facts (newest-first is the convention):
+# → use Write tool to save a JSON array:
+#   ["dev server lives on port 8080, probe {8080..8090} first",
+#    "login form selector: form[action='/login'] input[name='email']",
+#    "table is hydrated when: document.querySelectorAll('table tbody tr').length > 0"]
+
+# Add/remove a single fact:
+# → use Edit tool (Read first, then Edit to add/remove a line)
 ```
 
 **Auto-injected in eval:** if the instance was started with `--app`, the `memory`
@@ -476,14 +480,11 @@ return await snapshotInteractive();
 JS
 ```
 
-**Workflow:** the first agent on a new app pays the discovery cost. It records what
-it learned. Subsequent agents start with those facts and skip the discovery phase.
-`recall` is newest-first; re-recording a fact bumps it to the top. The list is
-bounded to 50 facts so stale ones age out.
+**Workflow:** the first agent on a new app pays the discovery cost. It writes what
+it learned to the memory file. Subsequent agents get the facts auto-injected into
+eval and skip the discovery phase.
 
-**No `--app` set?** `remember` and `recall` without `--app` resolve the key from the
-current shell's instance. If neither is available, both commands fail with a clear
-message. `memory` in eval context is just an empty array when no app is set.
+**No `--app` set?** The `memory` array in eval is just empty. No file is created.
 
 ## Error handling
 

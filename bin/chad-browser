@@ -302,12 +302,23 @@ EOF
   rmdir "$RUNDIR/.reserve-$port" 2>/dev/null || true
 
   if [[ $json -eq 1 ]]; then
-    python3 - "$port" "$name" "$pid" "$prof" "$ws" "$sock" "$driver_pid" <<'PY'
-import json, sys
-port, name, pid, prof, ws, sock, dpid = sys.argv[1:8]
-print(json.dumps({"port": int(port), "name": name, "pid": int(pid),
-                   "http": f"http://127.0.0.1:{port}", "ws": ws, "profile": prof,
-                   "socket": sock, "driver_pid": int(dpid) if dpid else None}))
+    local mem_path=""
+    [[ -n "$app" ]] && mem_path="$MEMORY_DIR/$app.json"
+    python3 - "$port" "$name" "$pid" "$prof" "$ws" "$sock" "$driver_pid" "$mem_path" <<'PY'
+import json, sys, os
+port, name, pid, prof, ws, sock, dpid, mem = sys.argv[1:9]
+d = {"port": int(port), "name": name, "pid": int(pid),
+     "http": f"http://127.0.0.1:{port}", "ws": ws, "profile": prof,
+     "socket": sock, "driver_pid": int(dpid) if dpid else None}
+if mem:
+    d["memory"] = mem
+    count = 0
+    if os.path.isfile(mem):
+        try:
+            with open(mem) as f: count = len(json.load(f))
+        except Exception: pass
+    d["memory_count"] = count
+print(json.dumps(d))
 PY
   else
     echo "PORT=$port"
@@ -317,6 +328,12 @@ PY
     echo "WS=$ws"
     echo "PROFILE=$prof"
     [[ -n "$sock" ]] && echo "SOCKET=$sock"
+    if [[ -n "$app" ]]; then
+      local memfile="$MEMORY_DIR/$app.json"
+      local count=0
+      [[ -f "$memfile" ]] && count=$(python3 -c "import json; print(len(json.load(open('$memfile'))))" 2>/dev/null || echo 0)
+      echo "MEMORY=$memfile ($count facts)"
+    fi
     echo
     if [[ -n "$sock" ]]; then
       echo "→ driver on $sock  (drive: chad-browser eval --name $name '<js>')"
@@ -779,109 +796,11 @@ cmd_probe() {
 # Memory lets agents that visit the same app share hard-won knowledge: which
 # selectors work, where the dev server lives, how to wait for hydration, etc.
 # Keyed by --app (set on `up`) so multiple dev-server ports collapse to one key.
-# Falls back to hostname for prod sites when --app wasn't passed.
-# Storage: $MEMORY_DIR/<key>.json — a flat array of strings.
-
-memory_key_for_instance() {
-  local runfile id_port id_name app
-  runfile=$(resolve_mine 2>/dev/null || resolve_id "${1:-}" 2>/dev/null) || return 1
-  [[ -n "$runfile" && -e "$runfile" ]] || return 1
-  app=$(grep -E '^APP=' "$runfile" | cut -d= -f2-)
-  if [[ -n "$app" ]]; then
-    echo "$app"
-    return 0
-  fi
-  # Fallback: derive a key from the hostname of the first URL the instance opened.
-  # For prod sites (app.example.com) this gives a stable key across port-less URLs.
-  echo "chad-browser: no --app set for this instance. Pass --app <name> on 'up', or use --app <name> on 'recall'/'remember'." >&2
-  return 1
-}
-
-cmd_remember() {
-  local app="" fact="" json=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --app)  app=$2; shift 2;;
-      --json) json=1; shift;;
-      -*)     die "unknown option '$1' (see: chad-browser remember --help)";;
-      *)      fact="${fact:+$fact }$1"; shift;;
-    esac
-  done
-  [[ -n "$fact" ]] || die "usage: chad-browser remember [--app <name>] \"<fact>\""
-  if [[ -z "$app" ]]; then
-    app=$(memory_key_for_instance) || die "no --app set and no instance found for this shell (pass --app <name> explicitly)"
-  fi
-  [[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
-    || die "invalid app key '$app': use letters, digits, ., _, - (max 64 chars)"
-  mkdir -p "$MEMORY_DIR"
-  local file="$MEMORY_DIR/$app.json" lockfile="$MEMORY_DIR/$app.lock"
-  # Atomic read-modify-write via flock. Without this, N parallel `remember`
-  # calls on the same app clobber each other (each reads the old file, appends
-  # its fact, writes back — last writer wins, N-1 facts silently lost).
-  (
-    flock -x 200 || die "could not acquire memory lock for '$app'"
-    local arr
-    if [[ -f "$file" ]]; then
-      arr=$(cat "$file" 2>/dev/null || echo '[]')
-    else
-      arr='[]'
-    fi
-    local new
-    new=$(printf '%s' "$arr" | python3 -c "
-import json, sys
-arr = json.load(sys.stdin)
-fact = sys.argv[1]
-if fact in arr:
-    arr.remove(fact)
-arr.insert(0, fact)
-arr = arr[:50]
-print(json.dumps(arr, indent=2))
-" "$fact" 2>/dev/null) || die "failed to update memory for '$app' (file may be corrupt: $file)"
-    printf '%s\n' "$new" > "$file"
-    if [[ $json -eq 1 ]]; then
-      printf '%s\n' "$new"
-    else
-      echo "remembered for '$app': $fact"
-    fi
-  ) 200>"$lockfile"
-}
-
-cmd_recall() {
-  local app="" json=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --app)  app=$2; shift 2;;
-      --json) json=1; shift;;
-      -*)     die "unknown option '$1' (see: chad-browser recall --help)";;
-      *)      die "unexpected argument '$1' (usage: chad-browser recall [--app <name>] [--json])";;
-    esac
-  done
-  if [[ -z "$app" ]]; then
-    app=$(memory_key_for_instance 2>/dev/null) || {
-      die "no --app set and no instance found for this shell (pass --app <name> explicitly)"
-    }
-  fi
-  [[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
-    || die "invalid app key '$app': use letters, digits, ., _, - (max 64 chars)"
-  local file="$MEMORY_DIR/$app.json"
-  if [[ ! -f "$file" ]]; then
-    if [[ $json -eq 1 ]]; then echo '[]'; else echo "(no memories yet for '$app')"; fi
-    return 0
-  fi
-  if [[ $json -eq 1 ]]; then
-    cat "$file"
-  else
-    echo "memories for '$app':"
-    cat "$file" | python3 -c "
-import json, sys
-arr = json.load(sys.stdin)
-for i, fact in enumerate(arr, 1):
-    print(f'  {i}. {fact}')
-if not arr:
-    print('  (none)')
-"
-  fi
-}
+# Storage: $MEMORY_DIR/<key>.json — a flat JSON array of strings.
+#
+# There are no remember/recall commands. The file is the source of truth and
+# agents read/write it with their native file tools (Read, Write, Edit, Grep).
+# The `up` command surfaces the path; the eval context auto-injects the array.
 
 cmd_info() {
   echo "BIN       $BIN -> $(command -v "$BIN" 2>/dev/null || echo MISSING)"
@@ -910,8 +829,6 @@ case "${1:-}" in
   repl)            shift; cmd_repl "$@";;
   gc)              shift; cmd_gc "$@";;
   probe)           shift; cmd_probe "$@";;
-  remember)        shift; cmd_remember "$@";;
-  recall)          shift; cmd_recall "$@";;
   info)            cmd_info;;
   ""|-h|--help)    usage;;
   *) die "unknown command '$1' (try: chad-browser --help)";;

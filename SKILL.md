@@ -159,8 +159,9 @@ The Node context exposes the full CDP surface plus these helpers:
   Each element includes `{ tag, id?, classes?, role?, text?, href?, type?, placeholder?, value? }`.
   Use instead of dumping `outerHTML` — you get the signal without the noise.
 - **`memory`** — an array of strings auto-injected from the instance's `--app` memory
-  file (facts saved by `chad-browser remember`). Empty if `up` was called without
-  `--app`. Lets agents that visit the same app skip discovery costs.
+  file. Empty if `up` was called without `--app`. Lets agents that visit the same app
+  skip discovery costs. The file path is shown in `up` output — read/write it with
+  native file tools (Read, Write, Edit, Grep).
 
 Full recipes (navigate, click, forms, downloads, iframes, screenshots) and the
 complete helper reference are in **`references/driving.md`**. Every `eval` call
@@ -197,20 +198,26 @@ ports), tag each instance with `--app` so they can share learned facts:
 
 ```bash
 chad-browser up --name agent1 --app cora-dev --headless http://localhost:8080
-chad-browser remember --app cora-dev "table hydration check: document.querySelectorAll('table tbody tr').length > 0"
-chad-browser remember --app cora-dev "login selector: form[action='/login'] input[name='email']"
+# up output includes: MEMORY=~/.cache/chad-browser/memory/cora-dev.json (0 facts)
+```
 
-# A second agent on the same app inherits these:
-chad-browser up --name agent2 --app cora-dev --headless http://localhost:8081
+The memory file is a plain JSON array of strings. Read and write it with native file
+tools — there are no `remember`/`recall` commands. The file is the source of truth:
+
+```js
+// Write facts to the file (from the SKILL.md example path above):
+// Use Write tool to save: ["fact1", "fact2", ...]
+
+// A second agent on the same app gets the facts auto-injected into eval:
 chad-browser eval --name agent2 --stdin <<'JS'
-// `memory` is auto-injected — apply the known hydration check from agent1
-const check = memory.find(m => m.includes('hydration check'));
+// `memory` is auto-injected from the file
 return { memories: memory.length, first: memory[0] };
 JS
 ```
 
-Memory files live at `~/.cache/chad-browser/memory/<app>.json`, newest-first,
-bounded to 50 entries. Use `chad-browser recall --app <name>` to inspect them.
+Memory files live at `~/.cache/chad-browser/memory/<app>.json`. The `up` command
+prints the path when `--app` is set. Use `Read` to inspect, `Write` to replace,
+`Edit` to add/remove individual facts, and `Grep` to search across multiple apps.
 
 ## Before you go further
 
