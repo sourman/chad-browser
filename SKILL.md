@@ -156,6 +156,7 @@ The Node context exposes the full CDP surface plus these helpers:
   CDP events, or ergonomically capture matching network requests + bodies.
 - **`snapshotInteractive({ max? })`** — return `{ url, title, count, elements }` for
   all visible interactive elements on the page (links, buttons, inputs, `[role]`).
+  Each element includes `{ tag, id?, classes?, role?, text?, href?, type?, placeholder?, value? }`.
   Use instead of dumping `outerHTML` — you get the signal without the noise.
 - **`memory`** — an array of strings auto-injected from the instance's `--app` memory
   file (facts saved by `chad-browser remember`). Empty if `up` was called without

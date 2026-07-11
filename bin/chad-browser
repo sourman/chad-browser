@@ -569,20 +569,40 @@ if page_flag:
     body = f'return evalInPage("(async () => {{ {inner} }})()")' if needs_iife else f'return evalInPage("{inner}")'
     if wait_expr:
         wait_inner = js_str_dq(wait_expr)
-        code = f'await waitForReady({{ check: "{wait_inner}", timeout: 15000, hint: "--wait check" }});\n{body}'
+        # Cap the wait timeout below the body timeout so the wait's own error
+        # fires first — otherwise a short --timeout produces a misleading
+        # "eval body timed out" when it was the --wait check that failed.
+        wait_to = 15000
+        if timeout_json:
+            try:
+                inner = timeout_json.strip().lstrip(',').strip()
+                body_ms = json.loads('{' + inner + '}')['timeout']
+                wait_to = max(500, min(15000, body_ms - 500))
+            except Exception:
+                pass
+        code = f'await waitForReady({{ check: "{wait_inner}", timeout: {wait_to}, hint: "--wait check" }});\n{body}'
     else:
         code = body
 elif wait_expr:
     # --wait without --page: prepend the wait call to the body (both in Node context).
     wait_inner = js_str_dq(wait_expr)
-    code = f'await waitForReady({{ check: "{wait_inner}", timeout: 15000, hint: "--wait check" }});\n' + code
+    wait_to = 15000
+    if timeout_json:
+        try:
+            inner = timeout_json.strip().lstrip(',').strip()
+            body_ms = json.loads('{' + inner + '}')['timeout']
+            wait_to = max(500, min(15000, body_ms - 500))
+        except Exception:
+            pass
+    code = f'await waitForReady({{ check: "{wait_inner}", timeout: {wait_to}, hint: "--wait check" }});\n' + code
 
 # Default client socket timeout 120s; if the caller set a body timeout, match it
 # (plus a 10s grace so the driver's own timeout error arrives before the socket's).
 client_timeout = 120
 if timeout_json:
     try:
-        body_ms = json.loads("{" + timeout_json.strip().rstrip(",") + "}")["timeout"]
+        inner = timeout_json.strip().lstrip(',').strip()
+        body_ms = json.loads('{' + inner + '}')['timeout']
         client_timeout = max(120, (body_ms // 1000) + 10)
     except Exception:
         pass
@@ -788,40 +808,42 @@ cmd_remember() {
     esac
   done
   [[ -n "$fact" ]] || die "usage: chad-browser remember [--app <name>] \"<fact>\""
-  # Resolve the app key: explicit --app flag wins; otherwise read it from the
-  # current shell's instance runfile.
   if [[ -z "$app" ]]; then
     app=$(memory_key_for_instance) || die "no --app set and no instance found for this shell (pass --app <name> explicitly)"
   fi
   [[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
     || die "invalid app key '$app': use letters, digits, ., _, - (max 64 chars)"
   mkdir -p "$MEMORY_DIR"
-  local file="$MEMORY_DIR/$app.json"
-  local arr
-  if [[ -f "$file" ]]; then
-    arr=$(cat "$file")
-  else
-    arr='[]'
-  fi
-  # Append + dedupe (case-sensitive). Keep newest-first so recall reads fresh.
-  local new
-  new=$(printf '%s' "$arr" | python3 -c "
+  local file="$MEMORY_DIR/$app.json" lockfile="$MEMORY_DIR/$app.lock"
+  # Atomic read-modify-write via flock. Without this, N parallel `remember`
+  # calls on the same app clobber each other (each reads the old file, appends
+  # its fact, writes back — last writer wins, N-1 facts silently lost).
+  (
+    flock -x 200 || die "could not acquire memory lock for '$app'"
+    local arr
+    if [[ -f "$file" ]]; then
+      arr=$(cat "$file" 2>/dev/null || echo '[]')
+    else
+      arr='[]'
+    fi
+    local new
+    new=$(printf '%s' "$arr" | python3 -c "
 import json, sys
 arr = json.load(sys.stdin)
 fact = sys.argv[1]
 if fact in arr:
     arr.remove(fact)
 arr.insert(0, fact)
-# Keep the list bounded — old facts that haven't been re-confirmed age out.
 arr = arr[:50]
 print(json.dumps(arr, indent=2))
-" "$fact")
-  printf '%s\n' "$new" > "$file"
-  if [[ $json -eq 1 ]]; then
-    printf '%s\n' "$new"
-  else
-    echo "remembered for '$app': $fact"
-  fi
+" "$fact" 2>/dev/null) || die "failed to update memory for '$app' (file may be corrupt: $file)"
+    printf '%s\n' "$new" > "$file"
+    if [[ $json -eq 1 ]]; then
+      printf '%s\n' "$new"
+    else
+      echo "remembered for '$app': $fact"
+    fi
+  ) 200>"$lockfile"
 }
 
 cmd_recall() {
@@ -836,8 +858,7 @@ cmd_recall() {
   done
   if [[ -z "$app" ]]; then
     app=$(memory_key_for_instance 2>/dev/null) || {
-      if [[ $json -eq 1 ]]; then echo '[]'; else echo "(no memories: no --app set on this instance, and no --app flag given)"; fi
-      return 0
+      die "no --app set and no instance found for this shell (pass --app <name> explicitly)"
     }
   fi
   [[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
