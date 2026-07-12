@@ -29,7 +29,6 @@ the inline positional `<js>` arg — use `--stdin` for anything with nested quot
 | `onEvent(method, fn)` | Subscribe to a CDP event. Returns an unsubscribe function. See [Network events](#network-events--capturing-requests). |
 | `captureRequests(urlPattern, fn, opts?)` | Run `fn` while collecting network requests whose URL matches `urlPattern` (substring or RegExp). Returns `{ requests, count }`. See [Network events](#network-events--capturing-requests). |
 | `snapshotInteractive({ max? })` | Return `{ url, title, count, elements }` for all visible interactive elements on the page (links, buttons, inputs, selects, `[role]`, `[tabindex]`). Each element is a compact object (`{ tag, id?, classes?, role?, text?, href?, type?, placeholder?, value? }`). Use this instead of dumping `outerHTML` — you get the signal without the noise. |
-| `memory` | Array of strings — facts from the instance's `--app` memory file. Auto-injected from `~/.cache/chad-browser/memory/<app>.json` (a plain JSON array). Read/write the file with native file tools. Empty if no `--app` was set on `up`. |
 
 `session` auto-routes to the active page target (set during `up`). Browser-level
 methods (`Browser.*`, `Target.*`) go to the browser endpoint. No domain is denied
@@ -448,10 +447,11 @@ chad-browser up --name agent1 --app cora-dev --headless http://localhost:8080
 ```
 
 **The file is the source of truth.** It's a plain JSON array of strings. There are
-no `remember`/`recall` commands — read and write the file with native file tools:
+no `remember`/`recall` commands and nothing is auto-injected — read and write the
+file with native file tools:
 
 ```bash
-# Read all facts for an app:
+# Read all facts for an app (do this once at the start of your session):
 # → use Read tool on ~/.cache/chad-browser/memory/cora-dev.json
 
 # Search across all apps' memories:
@@ -467,24 +467,12 @@ no `remember`/`recall` commands — read and write the file with native file too
 # → use Edit tool (Read first, then Edit to add/remove a line)
 ```
 
-**Auto-injected in eval:** if the instance was started with `--app`, the `memory`
-array is auto-injected into every `eval` context. You can read it directly:
-
-```bash
-chad-browser eval --name agent1 --stdin <<'JS'
-if (memory.length) {
-  console.log('inherited memories:', memory);
-  // e.g. apply a known-good hydration check from a prior agent
-}
-return await snapshotInteractive();
-JS
-```
-
 **Workflow:** the first agent on a new app pays the discovery cost. It writes what
-it learned to the memory file. Subsequent agents get the facts auto-injected into
-eval and skip the discovery phase.
+it learned to the memory file. Subsequent agents `Read` the file once at the start
+of their session and skip the discovery phase. The facts live in the agent's own
+context — no per-eval injection, no repeated context bloat.
 
-**No `--app` set?** The `memory` array in eval is just empty. No file is created.
+**No `--app` set?** No memory file is created or referenced. Nothing to clean up.
 
 ## Error handling
 

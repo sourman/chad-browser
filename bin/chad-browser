@@ -202,8 +202,9 @@ cmd_up() {
   # that gets `rm -rf`d on down. Reject anything that isn't a safe label.
   [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
     || die "invalid --name '$name': use letters, digits, ., _, - (max 64 chars), starting alphanumeric"
-  # --app tags the instance for the memory hook (chad-browser remember/recall).
-  # Same charset as --name (it's used as a filename under ~/.cache/chad-browser/memory).
+  # --app tags the instance for the memory hook. The path is surfaced in `up`
+  # output; agents read/write the file with native file tools. Same charset as
+  # --name (it's used as a filename under ~/.cache/chad-browser/memory).
   if [[ -n "$app" ]]; then
     [[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
       || die "invalid --app '$app': use letters, digits, ., _, - (max 64 chars), starting alphanumeric"
@@ -455,17 +456,6 @@ resolve_socket() {
   echo "$SOCKET"
 }
 
-# Resolve the runfile path for an instance id (or "mine" if empty). Used by the
-# memory hook to read APP= without re-sourcing the whole file.
-resolve_runfile_for() {
-  local id=${1:-}
-  if [[ -z "$id" ]]; then
-    resolve_mine 2>/dev/null || return 1
-  else
-    resolve_id "$id" 2>/dev/null || return 1
-  fi
-}
-
 # Send one JSON request over the Unix socket, read one newline-delimited response.
 # Usage: chad-browser eval [--id <name|port>] [--page] [--stdin|--file <f>|'<js>']
 cmd_eval() {
@@ -547,27 +537,7 @@ HELP
     [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a number of ms"
     timeout_json=", \"timeout\": $timeout"
   fi
-  # Resolve the app key for the memory hook. If this instance was started with
-  # --app, read the memory file and pass it in the payload so the driver can
-  # expose it as `memory` in the eval context. Empty/no file → empty array.
-  local mem_json=""
-  local runfile
-  if runfile=$(resolve_runfile_for "$id" 2>/dev/null); then
-    local app
-    app=$(grep -E '^APP=' "$runfile" 2>/dev/null | cut -d= -f2-)
-    if [[ -n "$app" ]]; then
-      local memfile="$MEMORY_DIR/$app.json"
-      if [[ -f "$memfile" ]]; then
-        # Compact to a single-line JSON array (the file is pretty-printed for
-        # human readability; embedding multi-line JSON breaks the payload parse).
-        # Validate first; skip silently if corrupt rather than crashing the eval.
-        local compact
-        compact=$(python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))" "$memfile" 2>/dev/null) \
-          && mem_json=", \"memory\": $compact"
-      fi
-    fi
-  fi
-  python3 - "$sock" "$code" "$timeout_json$mem_json" "$page" "$wait" <<'PY'
+  python3 - "$sock" "$code" "$timeout_json" "$page" "$wait" <<'PY'
 import socket, json, sys
 sock_path, code, timeout_json, page_flag, wait_expr = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5]
 
@@ -798,9 +768,9 @@ cmd_probe() {
 # Keyed by --app (set on `up`) so multiple dev-server ports collapse to one key.
 # Storage: $MEMORY_DIR/<key>.json — a flat JSON array of strings.
 #
-# There are no remember/recall commands. The file is the source of truth and
-# agents read/write it with their native file tools (Read, Write, Edit, Grep).
-# The `up` command surfaces the path; the eval context auto-injects the array.
+# There are no remember/recall commands and no eval-time injection. The file is
+# the source of truth; `up` surfaces the path and agents read/write it with
+# their native file tools (Read, Write, Edit, Grep).
 
 cmd_info() {
   echo "BIN       $BIN -> $(command -v "$BIN" 2>/dev/null || echo MISSING)"

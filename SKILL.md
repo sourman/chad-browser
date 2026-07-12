@@ -158,10 +158,6 @@ The Node context exposes the full CDP surface plus these helpers:
   all visible interactive elements on the page (links, buttons, inputs, `[role]`).
   Each element includes `{ tag, id?, classes?, role?, text?, href?, type?, placeholder?, value? }`.
   Use instead of dumping `outerHTML` — you get the signal without the noise.
-- **`memory`** — an array of strings auto-injected from the instance's `--app` memory
-  file. Empty if `up` was called without `--app`. Lets agents that visit the same app
-  skip discovery costs. The file path is shown in `up` output — read/write it with
-  native file tools (Read, Write, Edit, Grep).
 
 Full recipes (navigate, click, forms, downloads, iframes, screenshots) and the
 complete helper reference are in **`references/driving.md`**. Every `eval` call
@@ -201,23 +197,22 @@ chad-browser up --name agent1 --app cora-dev --headless http://localhost:8080
 # up output includes: MEMORY=~/.cache/chad-browser/memory/cora-dev.json (0 facts)
 ```
 
-The memory file is a plain JSON array of strings. Read and write it with native file
-tools — there are no `remember`/`recall` commands. The file is the source of truth:
+The memory file is a plain JSON array of strings. It's just a file — read it once
+with `Read`, write to it with `Write`/`Edit`, search across apps with `Grep`:
 
-```js
-// Write facts to the file (from the SKILL.md example path above):
-// Use Write tool to save: ["fact1", "fact2", ...]
+```bash
+# Agent 1 discovers facts and writes them:
+#   Use Write tool → ~/.cache/chad-browser/memory/cora-dev.json
+#   ["login form selector: form[action='/login'] input[name='email']",
+#    "table hydration check: document.querySelectorAll('table tbody tr').length > 0"]
 
-// A second agent on the same app gets the facts auto-injected into eval:
-chad-browser eval --name agent2 --stdin <<'JS'
-// `memory` is auto-injected from the file
-return { memories: memory.length, first: memory[0] };
-JS
+# Agent 2 reads the file at the start of its session:
+#   Use Read tool → ~/.cache/chad-browser/memory/cora-dev.json
 ```
 
-Memory files live at `~/.cache/chad-browser/memory/<app>.json`. The `up` command
-prints the path when `--app` is set. Use `Read` to inspect, `Write` to replace,
-`Edit` to add/remove individual facts, and `Grep` to search across multiple apps.
+The file path is surfaced in `up` output when `--app` is set. That's the entire
+hook — no injection, no special commands, no context engorgement. The agent reads
+the facts once into its context, remembers them for the session, and moves on.
 
 ## Before you go further
 
