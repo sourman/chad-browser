@@ -436,43 +436,70 @@ chad-browser script --name myagent /tmp/flow.js
 
 When multiple agents visit the same app (e.g. several agents testing different
 routes of a dev server), they can share hard-won knowledge: which selectors work,
-where the server lives, how to wait for hydration, etc. This is the **memory hook**.
+where the server lives, how to wait for hydration, etc.
 
-**Tag the instance with `--app` on `up`:**
+**Implicit surfacing on navigation:** when you call `navigate(url)`, the driver
+computes a memory key from the URL and checks for a memory file. If facts exist
+and haven't been surfaced yet this session, they ride along in the return value:
 
-```bash
-chad-browser up --name agent1 --app cora-dev --headless http://localhost:8080
-# Output includes:
-#   MEMORY=~/.cache/chad-browser/memory/cora-dev.json (0 facts)
+```javascript
+const result = await navigate('http://localhost:8080/w/regulatory-qa');
+// If no memories: result === "http://localhost:8080/w/regulatory-qa" (string)
+// If memories exist (first time this session):
+//   result === {
+//     href: "http://localhost:8080/w/regulatory-qa",
+//     memory: {
+//       key: "localhost",
+//       path: "~/.cache/chad-browser/memory/localhost.json",
+//       facts: [
+//         { fact: "chat textarea: textarea.flex.w-full",
+//           url: "http://localhost:8080/w/regulatory-qa",
+//           title: "[edge-watchdog-combined] Cora - ...",
+//           created: "2026-07-11T21:30:00Z",
+//           age: "2h" },
+//         ...
+//       ],
+//       note: "Memories from prior sessions on \"localhost\". ..."
+//     }
+//   }
 ```
 
-**The file is the source of truth.** It's a plain JSON array of strings. There are
-no `remember`/`recall` commands and nothing is auto-injected — read and write the
-file with native file tools:
+Each key surfaces **once per session** — you see the facts, remember them, done.
 
-```bash
-# Read all facts for an app (do this once at the start of your session):
-# → use Read tool on ~/.cache/chad-browser/memory/cora-dev.json
+**Key resolution (how the driver decides which file to check):**
+- Non-localhost URL → hostname (`kijiji.ca`, `app-prod.example.com`)
+- localhost / 127.0.0.1 → `localhost` (all dev servers share one file)
+  - Memories are fuzzy-matched by page title so the right facts surface for the
+    right app (e.g. `[main] Cora` matches `[edge-watchdog-combined] Cora` at 0.75)
+- `--app <name>` overrides everything (use it to group or separate apps)
 
-# Search across all apps' memories:
-# → use Grep tool on ~/.cache/chad-browser/memory/
-
-# Write facts (newest-first is the convention):
-# → use Write tool to save a JSON array:
-#   ["dev server lives on port 8080, probe {8080..8090} first",
-#    "login form selector: form[action='/login'] input[name='email']",
-#    "table is hydrated when: document.querySelectorAll('table tbody tr').length > 0"]
-
-# Add/remove a single fact:
-# → use Edit tool (Read first, then Edit to add/remove a line)
+**The `up` output always shows the memory path:**
+```
+MEMORY=~/.cache/chad-browser/memory/localhost.json (3 facts, key=localhost)
 ```
 
-**Workflow:** the first agent on a new app pays the discovery cost. It writes what
-it learned to the memory file. Subsequent agents `Read` the file once at the start
-of their session and skip the discovery phase. The facts live in the agent's own
-context — no per-eval injection, no repeated context bloat.
+**Writing memories:** use your native file tools on that path. The file is a JSON
+array of structured records:
 
-**No `--app` set?** No memory file is created or referenced. Nothing to clean up.
+```json
+[
+  {
+    "fact": "chat textarea selector: textarea.flex.w-full",
+    "url": "http://localhost:8080/w/regulatory-qa",
+    "title": "[edge-watchdog-combined] Cora - Your Personal Compliance Coach",
+    "created": "2026-07-11T21:30:00Z"
+  }
+]
+```
+
+Always include `url` and `title` — they let future agents verify the memory
+applies (especially on localhost where multiple apps share one file). The driver
+computes `age` from `created` when surfacing, so the agent can reason temporally
+("this is 2 days old, the UI may have changed").
+
+**Search across all apps:** `Grep` in `~/.cache/chad-browser/memory/`.
+
+**Override the key:** pass `--app <name>` on `up` to force a specific key.
 
 ## Error handling
 

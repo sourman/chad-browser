@@ -267,7 +267,7 @@ EOF
   rm -f "$sock"
   local driver_log="$CACHEDIR/$name-driver.log"
   if [[ -f "$DRIVER" ]]; then
-    node "$DRIVER" "$ws" "$sock" >"$driver_log" 2>&1 &
+    CB_MEMORY_DIR="$MEMORY_DIR" node "$DRIVER" "$ws" "$sock" >"$driver_log" 2>&1 &
     local driver_pid=$!
     disown 2>/dev/null || true
     if ! wait_for_driver "$sock" "$driver_pid"; then
@@ -284,6 +284,25 @@ EOF
     sock=""
   fi
 
+  # Derive the memory key: --app overrides, otherwise hostname from the first
+  # URL (or "localhost" for localhost/127.0.0.1/no-URL). The driver uses the
+  # same logic at navigate() time for implicit surfacing.
+  local memkey="$app"
+  if [[ -z "$memkey" ]]; then
+    if [[ ${#urls[@]} -gt 0 ]]; then
+      memkey=$(python3 -c "
+import sys
+try:
+    from urllib.parse import urlparse
+    h = urlparse(sys.argv[1]).hostname or ''
+    print('localhost' if h in ('localhost','127.0.0.1','0.0.0.0','') else h)
+except: print('localhost')
+" "${urls[0]}" 2>/dev/null || echo "localhost")
+    else
+      memkey="localhost"
+    fi
+  fi
+
   # SHELL_PID records the launching shell (PPID, not $$ which is this script's
   # own ephemeral PID) so per-shell instance resolution works: an agent's
   # eval/script calls walk up their process tree and match this shell.
@@ -298,27 +317,22 @@ SHELL_PID=$PPID
 DRIVER_PID=$driver_pid
 SOCKET=$sock
 APP=$app
+MEMKEY=$memkey
 EOF
-  # The real runfile is committed; the atomic reserve dir is now redundant.
   rmdir "$RUNDIR/.reserve-$port" 2>/dev/null || true
 
+  local memfile="$MEMORY_DIR/$memkey.json"
+  local memcount=0
+  [[ -f "$memfile" ]] && memcount=$(python3 -c "import json; print(len(json.load(open('$memfile'))))" 2>/dev/null || echo 0)
+
   if [[ $json -eq 1 ]]; then
-    local mem_path=""
-    [[ -n "$app" ]] && mem_path="$MEMORY_DIR/$app.json"
-    python3 - "$port" "$name" "$pid" "$prof" "$ws" "$sock" "$driver_pid" "$mem_path" <<'PY'
-import json, sys, os
-port, name, pid, prof, ws, sock, dpid, mem = sys.argv[1:9]
+    python3 - "$port" "$name" "$pid" "$prof" "$ws" "$sock" "$driver_pid" "$memkey" "$memfile" "$memcount" <<'PY'
+import json, sys
+port, name, pid, prof, ws, sock, dpid, memkey, memfile, memcount = sys.argv[1:11]
 d = {"port": int(port), "name": name, "pid": int(pid),
      "http": f"http://127.0.0.1:{port}", "ws": ws, "profile": prof,
-     "socket": sock, "driver_pid": int(dpid) if dpid else None}
-if mem:
-    d["memory"] = mem
-    count = 0
-    if os.path.isfile(mem):
-        try:
-            with open(mem) as f: count = len(json.load(f))
-        except Exception: pass
-    d["memory_count"] = count
+     "socket": sock, "driver_pid": int(dpid) if dpid else None,
+     "memory_key": memkey, "memory_file": memfile, "memory_count": int(memcount)}
 print(json.dumps(d))
 PY
   else
@@ -329,12 +343,7 @@ PY
     echo "WS=$ws"
     echo "PROFILE=$prof"
     [[ -n "$sock" ]] && echo "SOCKET=$sock"
-    if [[ -n "$app" ]]; then
-      local memfile="$MEMORY_DIR/$app.json"
-      local count=0
-      [[ -f "$memfile" ]] && count=$(python3 -c "import json; print(len(json.load(open('$memfile'))))" 2>/dev/null || echo 0)
-      echo "MEMORY=$memfile ($count facts)"
-    fi
+    echo "MEMORY=$memfile ($memcount facts, key=$memkey)"
     echo
     if [[ -n "$sock" ]]; then
       echo "→ driver on $sock  (drive: chad-browser eval --name $name '<js>')"
@@ -765,12 +774,25 @@ cmd_probe() {
 # --- memory hook -------------------------------------------------------------
 # Memory lets agents that visit the same app share hard-won knowledge: which
 # selectors work, where the dev server lives, how to wait for hydration, etc.
-# Keyed by --app (set on `up`) so multiple dev-server ports collapse to one key.
-# Storage: $MEMORY_DIR/<key>.json — a flat JSON array of strings.
 #
-# There are no remember/recall commands and no eval-time injection. The file is
-# the source of truth; `up` surfaces the path and agents read/write it with
-# their native file tools (Read, Write, Edit, Grep).
+# Key resolution (priority order):
+#   1. --app <name>   (explicit override)
+#   2. hostname        (non-localhost URLs: "kijiji.ca", "app-prod.example.com")
+#   3. "localhost"     (all localhost/127.0.0.1 dev servers share one file;
+#                       memories are fuzzy-matched by page title so the right
+#                       facts surface for the right app)
+#
+# Storage: $MEMORY_DIR/<key>.json — a JSON array of structured records:
+#   { fact, url, title, created, age }
+#
+# Surfacing is implicit and one-shot: on navigate() settle, the driver checks
+# the memory file for the page's key. If facts exist and haven't been surfaced
+# yet this session, they ride along in the navigate() return value. The agent
+# reads them once, holds them in its own context, done. No per-eval injection,
+# no remember/recall commands.
+#
+# Agents write new facts with native file tools (Read, Write, Edit) on the path
+# surfaced in `up` output.
 
 cmd_info() {
   echo "BIN       $BIN -> $(command -v "$BIN" 2>/dev/null || echo MISSING)"

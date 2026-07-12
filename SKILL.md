@@ -189,30 +189,45 @@ return automatically).
 
 ## Sharing knowledge across agents: the memory hook
 
-When multiple agents test the same app (e.g. several agents on different dev-server
-ports), tag each instance with `--app` so they can share learned facts:
+Agents that visit the same app can share hard-won knowledge: which selectors
+work, where the dev server lives, how to wait for hydration, etc. This happens
+**implicitly on navigation** — no flags, no commands, no per-eval injection.
 
-```bash
-chad-browser up --name agent1 --app cora-dev --headless http://localhost:8080
-# up output includes: MEMORY=~/.cache/chad-browser/memory/cora-dev.json (0 facts)
+**How it works:**
+
+1. When you call `navigate(url)`, the driver computes a memory key from the URL:
+   - Non-localhost → hostname (e.g. `kijiji.ca`, `app-prod.example.com`)
+   - localhost → `localhost` (all dev servers share one file; memories are
+     fuzzy-matched by page title so the right facts surface for the right app)
+2. If that key has a memory file with facts, and they haven't been surfaced yet
+   this session, they ride along in the `navigate()` return value:
+   ```json
+   { "href": "...", "memory": { "key": "localhost", "path": "~/.cache/.../localhost.json",
+     "facts": [{ "fact": "...", "url": "...", "title": "...", "created": "...", "age": "2h" }] } }
+   ```
+3. Each key surfaces **once per session**. You see the facts, remember them, done.
+4. The `up` output always shows the memory file path: `MEMORY=~/.cache/chad-browser/memory/localhost.json (N facts, key=localhost)`
+
+**Writing memories:** use your native file tools on the path from `up` output.
+The file is a JSON array of structured records:
+
+```json
+[
+  {
+    "fact": "chat textarea selector: textarea.flex.w-full",
+    "url": "http://localhost:8080/w/regulatory-qa",
+    "title": "[edge-watchdog-combined] Cora - Your Personal Compliance Coach",
+    "created": "2026-07-11T21:30:00Z"
+  }
+]
 ```
 
-The memory file is a plain JSON array of strings. It's just a file — read it once
-with `Read`, write to it with `Write`/`Edit`, search across apps with `Grep`:
+Include the `url` and `title` so future agents can verify the memory applies to
+their page (especially on localhost where multiple apps share one file). The
+driver computes `age` from `created` when surfacing.
 
-```bash
-# Agent 1 discovers facts and writes them:
-#   Use Write tool → ~/.cache/chad-browser/memory/cora-dev.json
-#   ["login form selector: form[action='/login'] input[name='email']",
-#    "table hydration check: document.querySelectorAll('table tbody tr').length > 0"]
-
-# Agent 2 reads the file at the start of its session:
-#   Use Read tool → ~/.cache/chad-browser/memory/cora-dev.json
-```
-
-The file path is surfaced in `up` output when `--app` is set. That's the entire
-hook — no injection, no special commands, no context engorgement. The agent reads
-the facts once into its context, remembers them for the session, and moves on.
+**Override the key:** pass `--app <name>` on `up` to force a specific key (useful
+for grouping apps that share a hostname, or separating prod from staging):
 
 ## Before you go further
 
