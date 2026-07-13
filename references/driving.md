@@ -22,7 +22,7 @@ the inline positional `<js>` arg — use `--stdin` for anything with nested quot
 | `waitForNavigation({ timeout?, hint? }, trigger)` | Arm a `Page.frameNavigated` listener, run `trigger` (e.g. a form submit or button click that causes a server-side navigation), then wait for the destination to settle. Returns the destination URL. Solves the read-after-submit pattern. |
 | `typeInto(selector, text, { delay? })` | Focus a field, select-all, delete, then `Input.insertText`. **Replaces** the value (unlike raw `insertText`, which appends). Works on React-controlled inputs. Throws clearly on readonly/disabled/hidden/contenteditable. Returns the field's new value. |
 | `resetInterception()` | Disable `Fetch`/`Network.setRequestInterception`. Call after traffic-interception experiments (blocking/mocking) so the loader doesn't stay wedged. Safe when no interception is active. |
-| `waitForReady({ check, timeout?, hint? })` | Poll a JS expression (in the page) until it returns truthy. Default timeout 10s, interval 300ms. `hint` is a human label included in the timeout error. If `check` itself throws, the error is surfaced immediately. |
+| `waitForReady({ check, timeout?, hint? })` | The **universal wait/poll** primitive. Polls ANY JS expression (in the page) until it returns truthy — use it for content-waiting (`document.body.innerText.includes("Done")`), element-waiting (`document.querySelector('#results')`), or readiness (`document.readyState === 'complete'`). Default timeout 10s, interval 300ms. `hint` is a human label included in the timeout error. If `check` itself throws, the error is surfaced immediately. On timeout, the error includes page diagnostics (body text length + last 300 chars, the check, elapsed time) so you can reason in one read. If `timeout` exceeds the eval body timeout, the body timeout is auto-extended. |
 | `waitForDomStable({ timeout?, hint?, minStableMs? })` | Wait until `querySelectorAll('*').length` is unchanged across **3** consecutive polls AND no skeleton/spinner selectors present AND the stable window spans ≥ `minStableMs` (default 600ms). **Weak heuristic** — prefer `waitForReady({check})` against real content for production scraping. |
 | `listPageTargets()` | Page targets from `Target.getTargets` (excludes chrome:// and devtools://). |
 | `use(targetId)` | Switch the active target via `Target.attachToTarget`. For cross-origin iframes and multi-tab flows. |
@@ -35,11 +35,58 @@ methods (`Browser.*`, `Target.*`) go to the browser endpoint. No domain is denie
 — you have the full CDP surface, including `Network`, `Page.captureScreenshot`,
 `Browser.setDownloadBehavior`, `Target.attachToTarget`.
 
-## Read-after-write: always wait for hydration
+## Waiting: `waitForReady` is the universal poll primitive
+
+`waitForReady({ check })` polls **any** JS expression in the page until it
+returns truthy. It is not a hydration-specific tool — it's the universal
+"wait until X is true" primitive. Use it for:
+
+- **Readiness** — `document.readyState === 'complete'`
+- **Content-waiting** — `document.body.innerText.includes('Welcome')`,
+  `document.body.innerText.includes('No results found')`
+- **Element-waiting** — `document.querySelector('#results')`,
+  `document.querySelectorAll('table tbody tr').length > 0`
+- **Any condition** — `myApp.loaded && !myApp.spinner`
+
+`check` can be **any** expression that returns a truthy/falsy value, not just
+`document.readyState`. If you find yourself writing a hand-rolled polling loop
+(`while (!cond) { await sleep(...) }`), you're reinventing `waitForReady` —
+use it instead.
+
+```js
+// Content-waiting: wait for specific text to appear (e.g. after an async action).
+await waitForReady({
+  check: 'document.body.innerText.includes("Export complete")',
+  timeout: 30000,
+  hint: 'export finished',
+});
+
+// Element-waiting: wait for a specific element.
+await waitForReady({
+  check: 'document.querySelector("#results tbody tr") !== null',
+  timeout: 10000,
+  hint: 'first result row',
+});
+
+// THEN read.
+return await evalInPage('document.querySelector("h1").textContent');
+```
+
+> **Timeout auto-extends.** If `timeout` exceeds the eval body's own timeout
+> (default 120s), the body timeout is automatically pushed out. So
+> `waitForReady({ timeout: 180000 })` works without setting `--timeout`.
+
+> **Timeouts include diagnostics.** On timeout, the error includes the `check`
+> expression, how long it actually waited, `document.body.innerText.length`
+> (is the page growing or stuck?), and the last 300 chars of body text (what's
+> actually on screen) — so you can reason in one read instead of running a
+> separate eval.
+
+### Hydration is the common case
 
 SPAs render skeleton/spinner placeholders for 1-3s before the real data. Reading
 too early is the #1 source of wrong answers (empty rows, undercounted results,
-stale counts). **Wait before you read.**
+stale counts). **Wait before you read** — and `waitForReady` is how.
 
 The `--wait` flag is the one-shot form — it polls a page JS expression until truthy,
 then runs the body:
@@ -51,27 +98,23 @@ return rows.map(r => r.textContent.trim());
 JS
 ```
 
-From the Node context, the equivalent is `waitForReady` / `waitForDomStable`:
+From the Node context, the equivalent is `waitForReady` (content check — preferred,
+you know what "ready" means for this page) or `waitForDomStable` (framework-agnostic
+fallback when you don't know the skeleton class):
 
 ```js
-// Explicit check — you know what "ready" means for this page.
 await waitForReady({
   check: 'document.querySelectorAll("table tbody tr").length > 0',
   timeout: 10000,
   hint: 'table rows present',
 });
 
-// Or the framework-agnostic default when you don't know the skeleton class.
+// Or, when you don't know what selector to check for:
 await waitForDomStable({ timeout: 10000, hint: 'initial render' });
 
 // THEN read.
 return await evalInPage('document.querySelector("h1").textContent');
 ```
-
-The `hint` is important: on timeout, the error reads
-`waitForReady timed out after 10000ms — table rows present (last value: null)`
-instead of a bare `timeout`. That's the difference between debugging in one read
-vs. ten turns of hypothesis.
 
 ## Navigate
 
@@ -506,7 +549,11 @@ computes `age` from `created` when surfacing, so the agent can reason temporally
 - A failed CDP call rejects with `Error: CDP <code>: <message>`.
 - A failed `evalInPage` (JS exception in the page) rejects with `Error: page JS error: <description>`.
 - A failed top-level `eval` body rejects with the error message and stack in the reply JSON.
-- A timeout in `waitForReady` / `waitForDomStable` rejects with a labeled message — read the label.
+- A timeout in `waitForReady` rejects with a labeled message that **includes
+  page diagnostics**: the `check` expression, elapsed time, `document.body.innerText.length`,
+  and the last 300 chars of body text — so you can reason about why it timed out
+  in one read instead of running a separate eval. `waitForDomStable` rejects
+  with a labeled message.
 - If your `waitForReady({ check })` expression itself throws (typo'd selector, runtime error),
   the error is surfaced immediately as `waitForReady check threw: ...` rather than timing out.
 - A `session.*` call that fails because the page navigated is auto-retried once after re-attach.
@@ -515,6 +562,9 @@ computes `age` from `created` when surfacing, so the agent can reason temporally
   loop (`while(true){ await something() }`) is caught and returns an error. A **purely
   synchronous** infinite loop (`while(true){}`) cannot be interrupted from the same process
   and will wedge the driver — the only recovery is `chad-browser down` + `up`.
+  **Note:** if a `waitForReady({ timeout })` call inside an eval needs more time than
+  the body timeout, the body timeout is automatically extended to accommodate it —
+  so long polls work without fiddling with `--timeout`.
 
 ### Return contract (what serializes, what silently empties)
 

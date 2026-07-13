@@ -508,7 +508,7 @@ In scope (default Node context — no imports needed):
   navigate(url, {timeout?, hint?})    Page.navigate + wait for readyState 'complete'
   typeInto(selector, text, {delay?})  focus + select-all + delete + insertText
   resetInterception()                 disable Fetch/Network interception (un-wedge after block)
-  waitForReady({ check, timeout?, hint? })   poll a page JS expr until truthy
+  waitForReady({ check, timeout?, hint? })   universal poll: wait until ANY page JS expr is truthy
   waitForDomStable({ timeout?, hint? })      wait until DOM node count stabilizes (3 samples)
   onEvent(method, fn)                 subscribe to a CDP event; returns unsub fn
   captureRequests(urlPattern, fn, {body?, timeout?})  capture matching network traffic

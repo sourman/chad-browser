@@ -136,9 +136,16 @@ The Node context exposes the full CDP surface plus these helpers:
   (`evalInPage(() => ...[])`) to avoid quoting hell with nested strings/regexes.
 - **`navigate(url, { timeout?, hint? })`** — `Page.navigate` + wait for
   `readyState === 'complete'`. **Prefer this over the raw two-step.**
-- **`waitForReady({ check, timeout?, hint? })`** — poll a JS expression in the page
-  until truthy. **Use before reading a page's content** — SPAs render skeleton
-  placeholders for 1-3s before real data hydrates; reading early gives empty rows.
+- **`waitForReady({ check, timeout?, hint? })`** — the universal **wait/poll** primitive.
+  Polls ANY JS expression in the page until it returns truthy. Not just for
+  hydration — use it for content-waiting (`document.body.innerText.includes("Welcome")`),
+  element-waiting (`document.querySelector('#results')`), or readiness
+  (`document.readyState === 'complete'`). `check` can be any expression that
+  returns a truthy/falsy value. On timeout, returns page diagnostics (body text
+  length + tail, the check expression, elapsed time) so you can debug in one
+  read instead of running a separate eval. If `timeout` exceeds the eval body
+  timeout, the body timeout is auto-extended — so `waitForReady({ timeout: 180000 })`
+  works without fiddling with `--timeout`.
 - **`waitForDomStable({ timeout?, hint? })`** — wait until node count is unchanged
   across 3 polls AND no skeleton/spinner selectors remain. Use when the framework
   is unknown.
@@ -169,9 +176,13 @@ return automatically).
 3. **Always `down` when done** — frees the port, kills the driver, deletes the profile.
 4. **Auth is snapshotted at `up` time.** Log in to the *base* chromium once; every
    clone inherits it. A login done in one clone does not reach others.
-5. **Wait for hydration before reading.** SPAs show skeleton placeholders before
-   real data. If `evalInPage` returns empty rows or a count looks wrong, read too
-   early — call `waitForReady` / `waitForDomStable` and retry.
+5. **Wait before you read.** SPAs show skeleton placeholders before real data, so
+   reading early gives empty rows or wrong counts. Use `waitForReady({ check })`
+   — it's the universal poll primitive: wait until ANY expression is truthy
+   (a content check like `document.body.innerText.includes("Results")`, an element
+   check like `document.querySelector('#results')`, or readiness like
+   `document.readyState === 'complete'`). If `evalInPage` returns empty rows or a
+   count looks wrong, you read too early.
 6. **`return` from `eval` (Node context).** No `return` means no value in the reply.
    In `--page` mode, a bare expression returns its value automatically.
 7. **CDP events are not methods.** `session.Network.requestWillBeSent(...)` is a bug
