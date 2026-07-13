@@ -21,6 +21,8 @@
 #                                       run a JS file against the page
 #   chad-browser repl [--id|--name <id>]          interactive JS prompt
 #   chad-browser probe <url>            find a live server (supports {8080..8090} ranges)
+#   chad-browser checkpoint <verb>      deep-freeze: save/restore full browser STATE
+#   chad-browser breadcrumb <verb>      record/replay the journey of ACTIONS
 #   chad-browser gc                     reap profiles whose process is gone
 #   chad-browser info                   resolved base/binary/port-range/driver
 #
@@ -246,7 +248,9 @@ EOF
   [[ -n "$store" ]] && args+=( --password-store="$store" )
   [[ $headless -eq 1 ]] && args+=( --headless=new )
   [[ ${#raw[@]} -gt 0 ]] && args+=( "${raw[@]}" )
-  [[ ${#urls[@]} -gt 0 ]] && args+=( "${urls[@]}" )
+  # The driver needs a page target to attach to. If no URL was given, open
+  # about:blank so the browser starts with one tab the driver can latch onto.
+  [[ ${#urls[@]} -gt 0 ]] && args+=( "${urls[@]}" ) || args+=( 'about:blank' )
 
   "$BIN" "${args[@]}" >/dev/null 2>&1 &
   local pid=$!
@@ -808,7 +812,350 @@ cmd_info() {
 }
 
 usage() {
-  sed -n '3,31p' "$0"
+  sed -n '3,33p' "$0"
+}
+
+# Send one eval request to a resolved driver socket and print the response.
+# Args: <sock> <js-body> [timeout_ms]. Reads no other input.
+send_eval() {
+  local sock=$1 code=$2 timeout=${3:-}
+  local timeout_json=""
+  if [[ -n "$timeout" ]]; then
+    timeout_json=", \"timeout\": $timeout"
+  fi
+  python3 - "$sock" "$code" "$timeout_json" <<'PY'
+import socket, json, sys
+sock_path, code, timeout_json = sys.argv[1], sys.argv[2], sys.argv[3]
+client_timeout = 120
+if timeout_json:
+    try:
+        inner = timeout_json.strip().lstrip(',').strip()
+        body_ms = json.loads('{' + inner + '}')['timeout']
+        client_timeout = max(120, (body_ms // 1000) + 10)
+    except Exception:
+        pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(client_timeout)
+try:
+    s.connect(sock_path)
+except (ConnectionRefusedError, FileNotFoundError) as e:
+    sys.stdout.write(json.dumps({"error": f"driver socket refused ({e}) — driver not running? run chad-browser list, then chad-browser down + up to recover"}) + "\n")
+    sys.exit(1)
+payload = json.dumps({"eval": code})
+if timeout_json:
+    payload = payload[:-1] + timeout_json + "}"
+s.sendall((payload + "\n").encode())
+buf = b""
+while b"\n" not in buf:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+sys.stdout.write(buf.decode() if buf else '{"error":"no response from driver"}\n')
+PY
+}
+
+# JSON-encode a JS string literal body for safe embedding.
+json_escape() {
+  python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1"
+}
+
+# --- filesystem-only operations for checkpoint/breadcrumb (no browser needed) ---
+# These let agents list/remove artifacts AFTER tearing down their browser, which
+# the driver-based path cannot do (the socket is gone after `down`).
+
+CHECKPOINT_DIR_FS="${CB_CHECKPOINT_DIR:-$CACHEDIR/checkpoints}"
+BREADCRUMB_DIR_FS="${CB_BREADCRUMB_DIR:-$CACHEDIR/breadcrumbs}"
+
+# List checkpoints from disk. Matches the JSON shape from checkpoint.list().
+# Args: (none). Prints a JSON array sorted newest-first.
+fs_checkpoint_list() {
+  python3 - "$CHECKPOINT_DIR_FS" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+if not os.path.isdir(d):
+    print("[]")
+    sys.exit(0)
+out = []
+for f in os.listdir(d):
+    if not f.endswith(".json"): continue
+    try:
+        rec = json.load(open(os.path.join(d, f)))
+    except Exception:
+        continue
+    out.append({
+        "id": rec.get("id", f.replace(".json","")),
+        "label": rec.get("label"),
+        "createdAt": rec.get("createdAt"),
+        "url": rec.get("url"),
+        "title": rec.get("title"),
+        "bytes": os.path.getsize(os.path.join(d, f)),
+    })
+out.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
+print(json.dumps(out))
+PY
+}
+
+# Remove a checkpoint by id-or-label from disk. Args: <id-or-label>.
+fs_checkpoint_rm() {
+  local target=$1
+  python3 - "$CHECKPOINT_DIR_FS" "$target" <<'PY'
+import json, os, sys
+d, target = sys.argv[1], sys.argv[2]
+if not os.path.isdir(d):
+    print(json.dumps({"error": f"no checkpoint directory: {d}"}))
+    sys.exit(1)
+# exact id match first
+exact = os.path.join(d, f"{target}.json")
+if os.path.isfile(exact):
+    os.remove(exact)
+    print(json.dumps({"id": target, "removed": True}))
+    sys.exit(0)
+# label substring match (newest by createdAt)
+matches = []
+for f in os.listdir(d):
+    if not f.endswith(".json"): continue
+    try:
+        rec = json.load(open(os.path.join(d, f)))
+    except Exception:
+        continue
+    lbl = rec.get("label") or ""
+    if target.lower() in lbl.lower():
+        matches.append((rec.get("createdAt") or "", f, rec.get("id")))
+if not matches:
+    print(json.dumps({"error": f"checkpoint not found: {target}"}))
+    sys.exit(1)
+matches.sort(reverse=True)
+_, f, cid = matches[0]
+os.remove(os.path.join(d, f))
+print(json.dumps({"id": cid, "removed": True}))
+PY
+}
+
+# List breadcrumbs from disk. Matches the JSON shape from breadcrumb.list().
+fs_breadcrumb_list() {
+  python3 - "$BREADCRUMB_DIR_FS" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+if not os.path.isdir(d):
+    print("[]")
+    sys.exit(0)
+out = []
+for f in os.listdir(d):
+    if not f.endswith(".json"): continue
+    try:
+        rec = json.load(open(os.path.join(d, f)))
+    except Exception:
+        continue
+    out.append({
+        "id": rec.get("id", f.replace(".json","")),
+        "label": rec.get("label"),
+        "startedAt": rec.get("startedAt"),
+        "finishedAt": rec.get("finishedAt"),
+        "eventCount": len(rec.get("events") or []),
+        "bytes": os.path.getsize(os.path.join(d, f)),
+    })
+out.sort(key=lambda r: r.get("startedAt") or "", reverse=True)
+print(json.dumps(out))
+PY
+}
+
+# Remove a breadcrumb by id-or-label from disk. Args: <id-or-label>.
+fs_breadcrumb_rm() {
+  local target=$1
+  python3 - "$BREADCRUMB_DIR_FS" "$target" <<'PY'
+import json, os, sys
+d, target = sys.argv[1], sys.argv[2]
+if not os.path.isdir(d):
+    print(json.dumps({"error": f"no breadcrumb directory: {d}"}))
+    sys.exit(1)
+exact = os.path.join(d, f"{target}.json")
+if os.path.isfile(exact):
+    os.remove(exact)
+    print(json.dumps({"id": target, "removed": True}))
+    sys.exit(0)
+matches = []
+for f in os.listdir(d):
+    if not f.endswith(".json"): continue
+    try:
+        rec = json.load(open(os.path.join(d, f)))
+    except Exception:
+        continue
+    lbl = rec.get("label") or ""
+    if target.lower() in lbl.lower():
+        matches.append((rec.get("startedAt") or "", f, rec.get("id")))
+if not matches:
+    print(json.dumps({"error": f"breadcrumb: not found: {target}"}))
+    sys.exit(1)
+matches.sort(reverse=True)
+_, f, cid = matches[0]
+os.remove(os.path.join(d, f))
+print(json.dumps({"id": cid, "removed": True}))
+PY
+}
+
+# Deep-freeze checkpoints: capture/restore full restorable page state
+# (cookies, localStorage, sessionStorage, URL, scroll). Lets an agent "save game"
+# before a destructive action and roll back without replaying the journey.
+cmd_checkpoint() {
+  local id="" verb="${1:-}" pos=()
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id|--name|-n) id=$2; shift 2;;
+      --help|-h) verb="help"; shift;;
+      -*) shift;;
+      *) pos+=("$1"); shift;;
+    esac
+  done
+  set -- "${pos[@]}"
+  local sock code label
+  case "$verb" in
+    save)
+      label="${1:-}"
+      sock=$(resolve_socket "$id") || exit 1
+      local label_json; label_json=$(json_escape "${label:-untitled}")
+      code="return await checkpoint.save({ label: $label_json });"
+      send_eval "$sock" "$code"
+      ;;
+    restore)
+      [[ -n "$1" ]] || die "usage: chad-browser checkpoint restore <id-or-label> [--id <instance>]"
+      sock=$(resolve_socket "$id") || exit 1
+      local target_json; target_json=$(json_escape "$1")
+      code="return await checkpoint.restore($target_json);"
+      send_eval "$sock" "$code"
+      ;;
+    list)
+      # list is a pure filesystem operation — no browser needed.
+      fs_checkpoint_list "$id"
+      ;;
+    rm|remove)
+      [[ -n "$1" ]] || die "usage: chad-browser checkpoint rm <id-or-label> [--id <instance>]"
+      # rm is a pure filesystem operation — no browser needed (works after down).
+      fs_checkpoint_rm "$1" "$id"
+      ;;
+    ""|help)
+      cat <<'HELP'
+chad-browser checkpoint <verb> [--id <name|port|pid>]
+
+Deep-freeze the browser's restorable state to disk and reload it later. State
+includes cookies, localStorage, sessionStorage, the current URL, and scroll
+position. Use this to "save game" before a destructive action (delete, submit,
+navigate away from a draft) and roll back to exactly that point without
+replaying the actions that got you there.
+
+Verbs:
+  save [label]              capture current state, write to disk, print {id,path,...}
+  restore <id-or-label>     reload a saved state into THIS browser
+  list                      list saved checkpoints (newest first)
+  rm <id-or-label>          delete a saved checkpoint file
+
+Checkpoint files live at: ~/.cache/chad-browser/checkpoints/cp_*.json
+The label lives inside the JSON only (never the filename). Restore matches on
+exact id OR case-insensitive label substring (newest on ambiguity).
+
+Note: this restores *state*, not the journey. To replay the actions that led
+somewhere, use `chad-browser breadcrumb`.
+HELP
+      ;;
+    *) die "unknown checkpoint verb '$verb' (try: chad-browser checkpoint help)";;
+  esac
+}
+
+# Breadcrumb trail: record the meaningful actions of a session (navigations,
+# POSTs, manual notes) and replay the restorable ones on a fresh browser.
+# Complements checkpoints — breadcrumbs replay the *journey*, checkpoints
+# restore the *destination*.
+cmd_breadcrumb() {
+  local id="" verb="${1:-}" pos=()
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id|--name|-n) id=$2; shift 2;;
+      --help|-h) verb="help"; shift;;
+      -*) shift;;
+      *) pos+=("$1"); shift;;
+    esac
+  done
+  set -- "${pos[@]}"
+  local sock code label
+  case "$verb" in
+    start)
+      label="${1:-}"
+      sock=$(resolve_socket "$id") || exit 1
+      local label_json; label_json=$(json_escape "${label:-untitled}")
+      code="return breadcrumb.start({ label: $label_json });"
+      send_eval "$sock" "$code"
+      ;;
+    note)
+      [[ -n "$1" ]] || die "usage: chad-browser breadcrumb note <action> [json-detail] [--id <instance>]"
+      sock=$(resolve_socket "$id") || exit 1
+      local action_json; action_json=$(json_escape "$1")
+      shift
+      local detail_json='{}'
+      if [[ -n "$1" ]]; then
+        detail_json=$(python3 -c 'import json,sys; json.loads(sys.argv[1]); sys.stdout.write(sys.argv[1])' "$1" 2>/dev/null || echo '{}')
+      fi
+      code="return breadcrumb.note($action_json, $detail_json);"
+      send_eval "$sock" "$code"
+      ;;
+    snapshot)
+      sock=$(resolve_socket "$id") || exit 1
+      code="return await breadcrumb.snapshot();"
+      send_eval "$sock" "$code"
+      ;;
+    stop)
+      sock=$(resolve_socket "$id") || exit 1
+      code="return await breadcrumb.stop();"
+      send_eval "$sock" "$code"
+      ;;
+    replay)
+      [[ -n "$1" ]] || die "usage: chad-browser breadcrumb replay <id-or-label> [--id <instance>]"
+      sock=$(resolve_socket "$id") || exit 1
+      local target_json; target_json=$(json_escape "$1")
+      code="return await breadcrumb.replay($target_json);"
+      send_eval "$sock" "$code"
+      ;;
+    list)
+      # list is a pure filesystem operation — no browser needed.
+      fs_breadcrumb_list "$id"
+      ;;
+    rm|remove)
+      [[ -n "$1" ]] || die "usage: chad-browser breadcrumb rm <id-or-label> [--id <instance>]"
+      # rm is a pure filesystem operation — no browser needed (works after down).
+      fs_breadcrumb_rm "$1" "$id"
+      ;;
+    ""|help)
+      cat <<'HELP'
+chad-browser breadcrumb <verb> [--id <name|port|pid>]
+
+Record a session's meaningful actions so the journey can be replayed later on a
+fresh browser. CDP events (top-frame navigations, POST requests) are captured
+automatically; manual actions (clicks, types, submits) are recorded via `note`.
+
+Verbs:
+  start [label]             begin recording (subscribes to CDP events)
+  note <action> [json]      add a manual action, e.g.:
+                              breadcrumb note click '{"selector":"#submit"}'
+                              breadcrumb note type  '{"selector":"#email","text":"a@b.com"}'
+  snapshot                  write the current recording to disk, keep recording
+  stop                      write to disk AND stop recording (unsubscribe events)
+  replay <id-or-label>      replay navigations + best-effort POSTs on THIS browser.
+                            Manual actions (clicks/types) are NOT auto-replayable —
+                            they are returned as `manualSteps` for the agent to redo.
+  list                      list saved breadcrumbs (newest first)
+  rm <id-or-label>          delete a saved breadcrumb file
+
+Breadcrumb files live at: ~/.cache/chad-browser/breadcrumbs/bc_*.json
+
+Replay is honest: navigations work; POSTs are attempted but expected to fail
+(CORS, expired CSRF); manual actions are returned in `manualSteps` rather than
+silently skipped. For full state restoration without replay, use
+`chad-browser checkpoint`.
+HELP
+      ;;
+    *) die "unknown breadcrumb verb '$verb' (try: chad-browser breadcrumb help)";;
+  esac
 }
 
 case "${1:-}" in
@@ -821,6 +1168,8 @@ case "${1:-}" in
   repl)            shift; cmd_repl "$@";;
   gc)              shift; cmd_gc "$@";;
   probe)           shift; cmd_probe "$@";;
+  checkpoint|cp)   shift; cmd_checkpoint "$@";;
+  breadcrumb|bc)   shift; cmd_breadcrumb "$@";;
   info)            cmd_info;;
   ""|-h|--help)    usage;;
   *) die "unknown command '$1' (try: chad-browser --help)";;

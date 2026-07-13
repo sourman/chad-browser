@@ -16,6 +16,8 @@ Full reference for every `chad-browser` command, flag, and env var. Verified aga
 | `repl [--id\|--name <id>]` | Interactive JS prompt (line-buffered). |
 | `gc` | Reap profiles/sockets whose process is gone + remove orphans. |
 | `probe <url>` | Probe a URL (supports `{8080..8090}` ranges / `{8080,8081}` lists) for a live HTTP server. Prints `<code> <url>` on the first responder. Use to find which localhost port the dev server is on. |
+| `checkpoint <verb>` (`cp`) | Deep-freeze: save/restore full browser STATE (cookies + localStorage + sessionStorage + URL + scroll). See [below](#checkpoint--deep-freeze-state). |
+| `breadcrumb <verb>` (`bc`) | Record/replay the journey of ACTIONS (navigations + POSTs + manual notes). See [below](#breadcrumb--record-and-replay-the-journey). |
 | `info` | Print resolved BASE / BIN / RUNDIR / SOCKDIR / DRIVER / NODE / port range. |
 | `--help` / `-h` / (no args) | Print the usage block. |
 
@@ -39,6 +41,7 @@ is an ancestor of the current shell.
 | `--` | Everything after is passed through as raw Chromium flags. |
 
 URLs are **positional** — there is no `--url`. Example: `chad-browser up https://a.com https://b.com`.
+If no URL is given, the browser opens `about:blank` (the driver needs a page target to attach to).
 
 Baked-in Chromium flags (anti-throttle so agent-driven background tabs don't stall):
 `--no-first-run --no-default-browser-check --no-pings --disable-background-timer-throttling
@@ -112,6 +115,78 @@ chad-browser script --name myagent /tmp/flow.js
 
 The reply is a single JSON line: `{"value": <result>}` on success, `{"error": "...",
 "stack": "..."}` on failure.
+
+## `checkpoint` — deep-freeze state
+
+`checkpoint <verb> [--id|--name <id>]` captures and restores the full restorable
+state of the page. All verbs target a running instance (resolved via `--id` /
+`--name`, or auto-resolved to "my instance" if omitted).
+
+| Verb | Args | Effect |
+|---|---|---|
+| `save` | `[label]` | Capture cookies + localStorage + sessionStorage + URL + scroll to a new checkpoint file. Returns `{ id, label, path, bytes, summary }`. |
+| `restore` | `<id-or-label>` | Reload a saved checkpoint into THIS browser: sets cookies, navigates to the saved URL, restores storage + scroll. Returns `{ id, found, applied, navigatedTo, warnings }`. Partial failures land in `warnings`. |
+| `list` | | List saved checkpoints (newest first): `[{ id, label, createdAt, url, title, bytes }]`. |
+| `rm` (`remove`) | `<id-or-label>` | Delete a checkpoint file. |
+
+`id-or-label` matches on exact id OR case-insensitive label substring (newest on
+ambiguity). Aliases: `checkpoint` = `cp`.
+
+**`list` and `rm` are filesystem operations** — they read/delete JSON files
+directly and don't need a running browser instance. Use them to clean up after
+`down`. `save` and `restore` do require a live instance (they capture/apply
+browser state).
+
+```bash
+chad-browser checkpoint save "after-login" --name X
+chad-browser checkpoint restore "after-login" --name X
+chad-browser checkpoint list --name X
+chad-browser checkpoint rm cp_20260713-160500_a1b2 --name X
+```
+
+Files: `~/.cache/chad-browser/checkpoints/cp_*.json`. The label lives inside the
+JSON only (never the filename) — safe for spaces/slashes.
+
+## `breadcrumb` — record and replay the journey
+
+`breadcrumb <verb> [--id|--name <id>]` records the meaningful actions of a
+session (top-frame navigations, POSTs, manual notes) and replays the restorable
+ones on a fresh browser. All verbs target a running instance.
+
+| Verb | Args | Effect |
+|---|---|---|
+| `start` | `[label]` | Begin recording. Subscribes to `Page.frameNavigated` (top-frame) + `Network.requestWillBeSent` (POSTs). Returns `{ id, label, path, recording }`. |
+| `note` | `<action> [json-detail]` | Record a manual action (click, type, submit, custom). `json-detail` must be valid JSON (e.g. `'{"selector":"#btn"}'`). Returns `{ recorded, index }`. |
+| `snapshot` | | Write the current recording to disk, keep recording. Returns `{ id, label, eventCount, events, path }`. |
+| `stop` | | Write to disk AND unsubscribe events + stop recording. Same return shape as `snapshot`. |
+| `replay` | `<id-or-label>` | Replay navigations + best-effort POSTs on THIS browser. Manual actions (clicks/types) are returned in `manualSteps` — not auto-replayable. Returns `{ stepsApplied, stepsSkipped, errors, finalUrl, manualSteps }`. |
+| `list` | | List saved breadcrumbs (newest first). |
+| `rm` (`remove`) | `<id-or-label>` | Delete a breadcrumb file. |
+
+Aliases: `breadcrumb` = `bc`.
+
+**`list` and `rm` are filesystem operations** — they read/delete JSON files
+directly and don't need a running browser instance. Use them to clean up after
+`down`. `start`, `note`, `snapshot`, `stop`, and `replay` do require a live
+instance.
+
+```bash
+chad-browser breadcrumb start "login-flow" --name X
+chad-browser breadcrumb note click '{"selector":"#login-btn"}' --name X
+chad-browser breadcrumb note type  '{"selector":"#email","text":"a@b.com"}' --name X
+chad-browser breadcrumb stop --name X
+
+# Replay on a fresh browser later
+chad-browser up --name fresh --headless
+chad-browser breadcrumb replay "login-flow" --name fresh
+```
+
+Files: `~/.cache/chad-browser/breadcrumbs/bc_*.json`.
+
+**Replay is honest:** navigations work; POSTs are attempted but expected to fail
+(CORS, expired CSRF — counted in `stepsSkipped`); manual actions are returned in
+`manualSteps` for the agent to redo. For full state restoration without replay,
+use `checkpoint`.
 
 ## Environment variables
 

@@ -29,6 +29,8 @@ the inline positional `<js>` arg — use `--stdin` for anything with nested quot
 | `onEvent(method, fn)` | Subscribe to a CDP event. Returns an unsubscribe function. See [Network events](#network-events--capturing-requests). |
 | `captureRequests(urlPattern, fn, opts?)` | Run `fn` while collecting network requests whose URL matches `urlPattern` (substring or RegExp). Returns `{ requests, count }`. See [Network events](#network-events--capturing-requests). |
 | `snapshotInteractive({ max? })` | Return `{ url, title, count, elements }` for all visible interactive elements on the page (links, buttons, inputs, selects, `[role]`, `[tabindex]`). Each element is a compact object (`{ tag, id?, classes?, role?, text?, href?, type?, placeholder?, value? }`). Use this instead of dumping `outerHTML` — you get the signal without the noise. |
+| `checkpoint` | Deep-freeze object. `checkpoint.save({ label })` captures cookies + localStorage + sessionStorage + URL + scroll to disk. `checkpoint.restore(idOrLabel)` reloads it. `.list()`, `.remove(idOrLabel)`. See [Checkpoints](#checkpoints--deep-freeze-state). |
+| `breadcrumb` | Action recorder. `breadcrumb.start({ label })` subscribes to nav/POST events. `.note(action, detail)` records manual actions. `.snapshot()` / `.stop()` write to disk. `.replay(idOrLabel)` replays navigations on a fresh browser (manual steps returned in `manualSteps`). `.list()`, `.remove(idOrLabel)`. See [Breadcrumbs](#breadcrumbs--record-and-replay-the-journey). |
 
 `session` auto-routes to the active page target (set during `up`). Browser-level
 methods (`Browser.*`, `Target.*`) go to the browser endpoint. No domain is denied
@@ -543,6 +545,176 @@ computes `age` from `created` when surfacing, so the agent can reason temporally
 **Search across all apps:** `Grep` in `~/.cache/chad-browser/memory/`.
 
 **Override the key:** pass `--app <name>` on `up` to force a specific key.
+
+## Checkpoints — deep-freeze state
+
+`checkpoint` captures the full restorable state of the page (cookies,
+localStorage, sessionStorage, current URL, scroll position) to a JSON file.
+Restore it later into the same or a different browser to land exactly where
+you left off — no action replay needed. Think "save game."
+
+### `checkpoint.save({ label })` → `{ id, label, path, bytes, summary }`
+
+```js
+const cp = await checkpoint.save({ label: 'after-login-and-filter' });
+// cp = {
+//   id: "cp_20260713-160500_a1b2",
+//   label: "after-login-and-filter",
+//   path: "~/.cache/chad-browser/checkpoints/cp_20260713-160500_a1b2.json",
+//   bytes: 4823,
+//   summary: { cookies: 12, localStorage: 8, sessionStorage: 2, url: "https://app.example.com/dashboard" }
+// }
+return cp;
+```
+
+### `checkpoint.restore(idOrLabel)` → `{ id, found, applied, navigatedTo, warnings }`
+
+```js
+const r = await checkpoint.restore('after-login-and-filter');
+// r = {
+//   id: "cp_20260713-160500_a1b2",
+//   found: true,
+//   applied: { cookies: 12, localStorage: 8, sessionStorage: 2 },
+//   navigatedTo: "https://app.example.com/dashboard",
+//   warnings: []   // partial failures (e.g. one cookie rejected) land here
+// }
+return r;
+```
+
+`idOrLabel` matches on exact id OR case-insensitive label substring (newest on
+ambiguity). Restore is **defensive**: each step is independently try/caught, so
+a cookie-set failure doesn't block storage restore — failures collect in
+`warnings` and the rest still applies.
+
+After `restore`, follow up with `waitForReady({ check })` if the destination
+page needs hydration before you read it.
+
+### `checkpoint.list()` / `checkpoint.remove(idOrLabel)`
+
+```js
+return checkpoint.list();
+// [{ id, label, createdAt, url, title, bytes }, ...]  // newest first
+
+await checkpoint.remove('after-login-and-filter');  // delete the file
+```
+
+### CLI shortcuts
+
+```bash
+chad-browser checkpoint save "label" --name X       # = checkpoint.save({label})
+chad-browser checkpoint restore <id-or-label> --name X
+chad-browser checkpoint list --name X
+chad-browser checkpoint rm <id-or-label> --name X
+```
+
+Files: `~/.cache/chad-browser/checkpoints/cp_*.json` (the label lives inside the
+JSON only, never the filename).
+
+### When to use checkpoints
+
+- **Roll back after a destructive action** — save before delete/submit, restore
+  to undo.
+- **Skip a long login + nav flow on a fresh browser** — save once, restore on
+  each new instance.
+- **Capture state for offline inspection** — the JSON is plain, read it with
+  file tools.
+
+## Breadcrumbs — record and replay the journey
+
+`breadcrumb` records the **meaningful actions** of a session (top-frame
+navigations via CDP events, POST requests, and manual `note`s for clicks/types)
+and replays the restorable ones on a fresh browser. Complements checkpoints:
+breadcrumbs replay the *journey*, checkpoints restore the *destination*.
+
+### `breadcrumb.start({ label })` → `{ id, label, path, recording }`
+
+Subscribes to `Page.frameNavigated` (top-frame only — child iframes are
+filtered) and `Network.requestWillBeSent` (POSTs only — GETs are too noisy).
+
+```js
+const bc = breadcrumb.start({ label: 'policy-draft-flow' });
+// bc = { id: "bc_20260713-160500_a1b2", label: "policy-draft-flow",
+//        path: "...", recording: { eventCount: 0, status: "recording" } }
+return bc;
+```
+
+### `breadcrumb.note(action, detail)` → `{ recorded, index }`
+
+Records a manual action CDP events don't capture. Use this after every click,
+type, or submit so the trail is complete:
+
+```js
+breadcrumb.note('click', { selector: '#login-btn' });
+breadcrumb.note('type',  { selector: '#email', text: 'a@b.com' });
+breadcrumb.note('custom', { step: 'accepted-cookie-banner' });
+```
+
+### `breadcrumb.snapshot()` / `breadcrumb.stop()` → `{ id, label, eventCount, events, path }`
+
+Both write the recording to disk as pretty JSON. `stop` also unsubscribes the
+CDP event listeners and marks the recording stopped. Use `snapshot` to write
+intermediate checkpoints of the trail without stopping; use `stop` when done.
+
+### `breadcrumb.replay(idOrLabel)` → `{ stepsApplied, stepsSkipped, errors, finalUrl, manualSteps }`
+
+Replays against the **current** browser:
+
+```js
+const r = await breadcrumb.replay('policy-draft-flow');
+// r = {
+//   stepsApplied: 2,     // navigations that ran
+//   stepsSkipped: 1,     // POSTs attempted but expected to fail (CORS, expired CSRF)
+//   errors: [{ index: 3, error: "NetworkError..." }],
+//   finalUrl: "https://app.example.com/dashboard",
+//   manualSteps: [       // actions YOU must redo — not auto-replayable
+//     { type: "action", action: "click", detail: { selector: "#login-btn" } },
+//     { type: "action", action: "type",  detail: { selector: "#email", text: "a@b.com" } }
+//   ]
+// }
+return r;
+```
+
+**Replay is honest, not theater:**
+- **Navigations** work (counted in `stepsApplied`).
+- **POSTs** are best-effort via in-page `fetch` — expected to fail due to CORS
+  or expired CSRF/auth. They're attempted, counted in `stepsSkipped`, and any
+  error is captured in `errors`. The agent should treat these as informational.
+- **Manual actions** (clicks/types) are returned verbatim in `manualSteps`. The
+  element may not be present at replay time, so the agent must redo them in the
+  right order, waiting for each target to appear.
+
+### `breadcrumb.list()` / `breadcrumb.remove(idOrLabel)`
+
+```js
+return breadcrumb.list();
+// [{ id, label, startedAt, finishedAt, eventCount, bytes }, ...]  // newest first
+
+await breadcrumb.remove('policy-draft-flow');
+```
+
+### CLI shortcuts
+
+```bash
+chad-browser breadcrumb start "label" --name X
+chad-browser breadcrumb note click '{"selector":"#btn"}' --name X
+chad-browser breadcrumb snapshot --name X
+chad-browser breadcrumb stop --name X
+chad-browser breadcrumb replay <id-or-label> --name X
+chad-browser breadcrumb list --name X
+chad-browser breadcrumb rm <id-or-label> --name X
+```
+
+Files: `~/.cache/chad-browser/breadcrumbs/bc_*.json`.
+
+### When to use breadcrumbs vs checkpoints
+
+| Goal | Use |
+|---|---|
+| Roll back after a destructive action | **checkpoint** save → act → restore |
+| Skip a long login + nav flow on a fresh browser | **checkpoint** save once → restore on each new browser |
+| Reproduce a multi-step journey on a clean slate | **breadcrumb** record → replay (redo `manualSteps`) |
+| Capture state for offline inspection | **checkpoint** save (the JSON is readable) |
+| Resume a flow that needs real clicks in order | **breadcrumb** replay navigations, redo `manualSteps` |
 
 ## Error handling
 

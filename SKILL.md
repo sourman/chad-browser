@@ -165,6 +165,14 @@ The Node context exposes the full CDP surface plus these helpers:
   all visible interactive elements on the page (links, buttons, inputs, `[role]`).
   Each element includes `{ tag, id?, classes?, role?, text?, href?, type?, placeholder?, value? }`.
   Use instead of dumping `outerHTML` — you get the signal without the noise.
+- **`checkpoint`** — deep-freeze object: `checkpoint.save({ label })`,
+  `checkpoint.restore(idOrLabel)`, `checkpoint.list()`, `checkpoint.remove(idOrLabel)`.
+  Captures/restores cookies + localStorage + sessionStorage + URL + scroll. See
+  "Save game / roll back" below.
+- **`breadcrumb`** — action recorder: `breadcrumb.start({ label })`,
+  `breadcrumb.note(action, detail)`, `breadcrumb.snapshot()` / `.stop()`,
+  `breadcrumb.replay(idOrLabel)`, `.list()`, `.remove(idOrLabel)`. Records and
+  replays the session journey. See "Save game / roll back" below.
 
 Full recipes (navigate, click, forms, downloads, iframes, screenshots) and the
 complete helper reference are in **`references/driving.md`**. Every `eval` call
@@ -239,6 +247,91 @@ driver computes `age` from `created` when surfacing.
 
 **Override the key:** pass `--app <name>` on `up` to force a specific key (useful
 for grouping apps that share a hostname, or separating prod from staging):
+
+## Save game / roll back: checkpoints and breadcrumbs
+
+Two orthogonal features let an agent preserve and restore browser state so it
+doesn't have to replay expensive flows from scratch:
+
+### Checkpoints — deep-freeze the destination
+
+Capture the **full restorable state** (cookies, localStorage, sessionStorage,
+current URL, scroll position) to disk. Restore it later into the same or a
+different browser to land exactly where you left off — no action replay needed.
+
+Use this to "save game" before a destructive action (delete, submit, navigate
+away from a draft) and roll back cleanly, or to skip a long login + navigation
+flow on a fresh browser.
+
+```bash
+# Save where you are
+chad-browser checkpoint save "after-login-and-filter" --name myagent
+# → { id: "cp_20260713-...", path: "~/.cache/.../cp_*.json", summary: {...} }
+
+# Do something risky...
+chad-browser eval --name myagent --stdin <<'JS'
+return await navigate('https://app.example.com/delete-everything');
+JS
+
+# Roll back to the saved state
+chad-browser checkpoint restore "after-login-and-filter" --name myagent
+# → navigates to the saved URL, restores cookies + storage + scroll
+
+# Manage saved checkpoints
+chad-browser checkpoint list --name myagent
+chad-browser checkpoint rm <id-or-label> --name myagent
+```
+
+Restore matches on exact `id` OR a case-insensitive label substring (newest on
+ambiguity). Partial failures (e.g. cookie set fails) land in `warnings` and the
+rest still applies — it's defensive, not all-or-nothing.
+
+### Breadcrumbs — record and replay the journey
+
+Record the **meaningful actions** of a session (top-frame navigations, POST
+requests, plus manual `note`s for clicks/types/submits) and replay the
+restorable ones on a fresh browser. Complements checkpoints: breadcrumbs replay
+the *journey*, checkpoints restore the *destination*.
+
+```bash
+# Start recording
+chad-browser breadcrumb start "policy-draft-flow" --name myagent
+
+# Drive the browser as usual — navigations and POSTs are captured automatically
+chad-browser eval --name myagent --stdin <<'JS'
+return await navigate('https://app.example.com/login');
+JS
+
+# Note manual actions CDP events don't see (clicks, types)
+chad-browser breadcrumb note click '{"selector":"#login-btn"}' --name myagent
+chad-browser breadcrumb note type  '{"selector":"#email","text":"a@b.com"}' --name myagent
+
+# Stop + write to disk
+chad-browser breadcrumb stop --name myagent
+
+# Replay on a fresh browser later
+chad-browser up --name fresh --headless
+chad-browser breadcrumb replay "policy-draft-flow" --name fresh
+# → { stepsApplied: 2, stepsSkipped: 1, manualSteps: [...], finalUrl: "..." }
+```
+
+**Replay is honest, not theater:** navigations work; POSTs are attempted but
+expected to fail (CORS, expired CSRF — they're counted in `stepsSkipped`);
+manual actions (clicks/types) are returned verbatim in `manualSteps` because
+the element may not be present yet — the agent must redo them.
+
+### When to use which
+
+| You want to… | Use |
+|---|---|
+| Roll back after a destructive action | **checkpoint** save → act → restore |
+| Skip a long login + nav flow on a fresh browser | **checkpoint** save once → restore on each new browser |
+| Reproduce a multi-step journey on a clean slate | **breadcrumb** start → drive → stop → replay |
+| Capture state for offline inspection | **checkpoint** save (the JSON is readable) |
+| Resume a flow that needs real clicks in the right order | **breadcrumb** replay the navigations, redo `manualSteps` |
+
+Both write JSON under `~/.cache/chad-browser/` (`checkpoints/`, `breadcrumbs/`).
+The files are plain JSON — read them with your file tools for offline inspection.
 
 ## Before you go further
 
