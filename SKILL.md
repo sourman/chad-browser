@@ -93,6 +93,13 @@ chad-browser down myagent
 
 `up` prints `PORT=` / `NAME=` / `PID=` / `HTTP=` / `WS=` / `PROFILE=` / `SOCKET=`.
 
+**When launching headed, state the instance name prominently** — e.g.
+"Launching browser **cora-qa**" — as a standalone sentence, not buried inside
+another sentence. The user identifies headed windows by the avatar badge name
+and frame color, so they need the name to know which window to watch. **When
+launching headless, do not mention visual details** — no window exists, so
+color/avatar info is noise.
+
 ### When to use which mode
 
 | You want to… | Use |
@@ -154,7 +161,10 @@ The Node context exposes the full CDP surface plus these helpers:
   the destination to settle. Use for read-after-submit flows instead of blind polling.
 - **`typeInto(selector, text, { delay? })`** — focus + select-all + delete +
   `Input.insertText`. **Replaces** the field value. Works on React-controlled inputs.
-  Throws on readonly/disabled/hidden/contenteditable.
+  Throws on readonly/disabled/hidden/contenteditable. **In cross-origin iframes**
+  (after `use()`), `Input.insertText` may be truncated by the iframe's sandbox —
+  if the value comes back short, fall back to direct DOM: `evalInPage(() => {
+  el.value = 'text'; el.dispatchEvent(new Event('input', {bubbles:true})) })`.
 - **`listPageTargets()` / `use(targetId)`** — enumerate/switch page targets (for
   cross-origin iframes, multi-tab).
 - **`resetInterception()`** — disable `Fetch`/`Network.setRequestInterception` after
@@ -182,6 +192,9 @@ return automatically).
 ## Rules that will bite you
 
 3. **Always `down` when done** — frees the port, kills the driver, deletes the profile.
+   **But only `down` instances YOU spawned.** If you didn't launch it, leave it be —
+   another agent may be actively driving it. Run `chad-browser list` to see all
+   instances; only tear down the ones whose `NAME` matches what you passed to `up`.
 4. **Auth is snapshotted at `up` time.** Log in to the *base* chromium once; every
    clone inherits it. A login done in one clone does not reach others.
 5. **Wait before you read.** SPAs show skeleton placeholders before real data, so
@@ -205,6 +218,15 @@ return automatically).
    from `evalInPage` or `--page` mode yields a descriptive string like
    `"<h1 class=\"title\">Welcome</h1>"` — not `{}` (the silent empty CDP gives by
    default). Use this to probe elements without extracting `.textContent` by hand.
+10. **Headless UA triggers bot detection.** The headless User-Agent contains
+    "HeadlessChrome" — sites like DuckDuckGo will CAPTCHA immediately. Override it:
+    `await session.Network.setUserAgentOverride({ userAgent: 'Mozilla/5.0 ... Chrome/137.0.0.0 ...' })`.
+    Do this right after `up` before navigating to the target site.
+11. **`evalInPage` can hit "Object reference chain too long".** Returning complex
+    DOM objects (arrays of elements, nested nodes) from Node context can exceed
+    CDP's serialization depth. **Use `--page` mode** instead — it runs JS directly
+    in the page and serializes results more reliably. Extract primitives (strings,
+    numbers, arrays of strings) rather than DOM nodes.
 
 ## Sharing knowledge across agents: the memory hook
 
